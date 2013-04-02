@@ -1,10 +1,4 @@
-MYSQL_CONFIG = {
-  :username => 'arjdbc',
-  :password => 'arjdbc',
-  :adapter  => 'mysql',
-  :database => 'arjdbc_test',
-  :host     => 'localhost'
-}
+require 'test_helper'
+require 'db/mysql_config'
 
 ActiveRecord::Base.establish_connection(MYSQL_CONFIG)
-

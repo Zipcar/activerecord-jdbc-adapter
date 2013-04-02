@@ -1,14 +1,12 @@
 require 'rake/testtask'
 require 'rake/clean'
-CLEAN.include 'derby*', 'test.db.*','test/reports', 'test.sqlite3','lib/**/*.jar','manifest.mf', '*.log'
+CLEAN.include 'derby*', 'test.db.*','test/reports', 'test.sqlite3','lib/**/*.jar','manifest.mf', '*.log', 'target/*'
 
-require 'bundler'
+require 'bundler/gem_helper'
 Bundler::GemHelper.install_tasks
+
 require 'bundler/setup'
-
 require 'appraisal'
-
-require File.expand_path('../test/helper', __FILE__)
 
 task :default => [:jar, :test]
 
@@ -16,46 +14,55 @@ task :default => [:jar, :test]
 task :build => :jar
 task :install => :jar
 
-ADAPTERS = %w[derby h2 hsqldb mssql mysql postgresql sqlite3].map {|a| "activerecord-jdbc#{a}-adapter" }
-DRIVERS  = %w[derby h2 hsqldb jtds mysql postgres sqlite3].map {|a| "jdbc-#{a}" }
+ADAPTERS = %w[derby h2 hsqldb mssql mysql postgresql sqlite3].map { |a| "activerecord-jdbc#{a}-adapter" }
+DRIVERS  = %w[derby h2 hsqldb jtds mysql postgres sqlite3].map { |a| "jdbc-#{a}" }
+TARGETS = ( ADAPTERS + DRIVERS )
 
-def rake(args)
+def rake(*args)
   ruby "-S", "rake", *args
 end
 
-(ADAPTERS + DRIVERS).each do |adapter|
-  namespace adapter do
-
+TARGETS.each do |target|
+  namespace target do
     task :build do
-      Dir.chdir(adapter) do
-        rake "build"
-      end
-      cp FileList["#{adapter}/pkg/#{adapter}-*.gem"], "pkg"
+      Dir.chdir(target) { rake "build" }
+      cp FileList["#{target}/pkg/#{target}-*.gem"], "pkg"
     end
-
-    # bundler handles install => build itself
     task :install do
-      Dir.chdir(adapter) do
-        rake "install"
-      end
+      Dir.chdir(target) { rake "install" }
     end
-
     task :release do
-      Dir.chdir(adapter) do
-        rake "release"
-      end
+      Dir.chdir(target) { rake "release" }
     end
   end
 end
 
-desc "Release all adapters"
-task "all:release" => ["release", *ADAPTERS.map { |f| "#{f}:release" }]
+# DRIVERS
 
-desc "Install all adapters"
-task "all:install" => ["install", *ADAPTERS.map { |f| "#{f}:install" }]
+desc "Build drivers"
+task "drivers:build" => DRIVERS.map { |name| "#{name}:build" }
 
-desc "Build all adapters"
-task "all:build"   => ["build", *ADAPTERS.map { |f| "#{f}:build" }]
+desc "Install drivers"
+task "drivers:install" => DRIVERS.map { |name| "#{name}:install" }
+
+desc "Release drivers"
+task "drivers:release" => DRIVERS.map { |name| "#{name}:release" }
+
+# ADAPTERS
+
+desc "Build adapters"
+task "adapters:build" => [ 'build' ] + ADAPTERS.map { |name| "#{name}:build" }
+
+desc "Install adapters"
+task "adapters:install" => [ 'install' ] + ADAPTERS.map { |name| "#{name}:install" }
+
+desc "Release adapters"
+task "adapters:release" => [ 'release' ] + ADAPTERS.map { |name| "#{name}:release" }
+
+# ALL
+
+task "all:build" => [ 'build' ] + TARGETS.map { |name| "#{name}:build" }
+task "all:install" => [ 'install' ] + TARGETS.map { |name| "#{name}:install" }
 
 task :filelist do
   puts FileList['pkg/**/*'].inspect

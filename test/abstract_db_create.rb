@@ -1,4 +1,4 @@
-require 'jdbc_common'
+require 'test_helper'
 require 'rake'
 
 module Rails
@@ -37,7 +37,7 @@ module AbstractDbCreate
     setup_rails
     set_rails_constant("env", @env)
     set_rails_constant("root", ".")
-    load File.dirname(__FILE__) + '/../lib/arjdbc/jdbc/jdbc.rake' if jruby?
+    load File.dirname(__FILE__) + '/../lib/arjdbc/jdbc/jdbc.rake' if defined?(JRUBY_VERSION)
     task :environment do
       ActiveRecord::Base.configurations = configurations
       @full_env_loaded = true
@@ -58,19 +58,19 @@ module AbstractDbCreate
   end
 
   def setup_rails
-    if ActiveRecord::VERSION::MAJOR == 3
-      setup_rails3
-    else
+    if ActiveRecord::VERSION::MAJOR <= 2
       setup_rails2
+    else
+      setup_rails3
     end
   end
 
   def configurations
-    the_db_name = @db_name
-    the_db_config = db_config
-    the_db_config = the_db_config.merge({:database => the_db_name}) if the_db_name
-    the_db_config.stringify_keys!
-    @configs = { @env => the_db_config }
+    db_name = @db_name
+    db_config = self.db_config
+    db_config = db_config.merge({:database => db_name}) if db_name
+    db_config.stringify_keys!
+    @configs = { @env => db_config }
     @configs["test"] = @configs[@env].dup
     @configs
   end
@@ -82,6 +82,10 @@ module AbstractDbCreate
     end
     ar_version = $LOADED_FEATURES.grep(%r{active_record/version}).first
     ar_lib_path = $LOAD_PATH.detect {|p| p if File.exist?File.join(p, ar_version)}
+    # if the old style finder didn't work, assume we have the absolute path already
+    if ar_lib_path.nil? && File.exist?(ar_version)
+      ar_lib_path = ar_version.sub(%r{/active_record/version.*}, '')
+    end
     ar_lib_path = ar_lib_path.sub(%r{activerecord/lib}, 'railties/lib') # edge rails
     rails_lib_path = ar_lib_path.sub(/activerecord-([\d\.]+)/, 'rails-\1') # gem rails
     load "#{rails_lib_path}/tasks/databases.rake"

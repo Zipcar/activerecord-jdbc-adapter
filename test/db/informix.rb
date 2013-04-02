@@ -1,3 +1,5 @@
+require 'test_helper'
+
 config = {
   :username   => 'blog',
   :password   => 'blog',

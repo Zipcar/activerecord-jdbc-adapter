@@ -18,5 +18,5 @@ patches*
 /bin
 /jndi_test/jdbc/.bindings
 target
-/test/fscontext.jar
-/test/providerutil.jar
+test/jars
+coverage

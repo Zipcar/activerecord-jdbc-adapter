@@ -31,39 +31,42 @@ import java.io.InputStream;
 import java.io.Reader;
 import java.io.StringReader;
 import java.math.BigInteger;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.SQLXML;
 import java.sql.Statement;
+import java.sql.Date;
+import java.sql.Time;
 import java.sql.Timestamp;
 import java.sql.Types;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Calendar;
-import java.util.Date;
 import java.util.List;
 
 import org.jruby.Ruby;
 import org.jruby.RubyArray;
 import org.jruby.RubyBignum;
+import org.jruby.RubyBoolean;
 import org.jruby.RubyClass;
 import org.jruby.RubyHash;
+import org.jruby.RubyInteger;
 import org.jruby.RubyModule;
 import org.jruby.RubyNumeric;
 import org.jruby.RubyObject;
-import org.jruby.RubyObjectAdapter;
 import org.jruby.RubyString;
 import org.jruby.RubySymbol;
 import org.jruby.RubyTime;
 import org.jruby.anno.JRubyMethod;
 import org.jruby.exceptions.RaiseException;
-import org.jruby.javasupport.Java;
 import org.jruby.javasupport.JavaEmbedUtils;
-import org.jruby.javasupport.JavaObject;
+import org.jruby.javasupport.JavaUtil;
 import org.jruby.javasupport.util.RuntimeHelpers;
 import org.jruby.runtime.Arity;
 import org.jruby.runtime.Block;
@@ -76,23 +79,12 @@ import org.jruby.util.ByteList;
  * Part of our ActiveRecord::ConnectionAdapters::Connection impl.
  */
 public class RubyJdbcConnection extends RubyObject {
-    private static final String[] TABLE_TYPE = new String[]{"TABLE"};
-    private static final String[] TABLE_TYPES = new String[]{"TABLE", "VIEW", "SYNONYM"};
-
-    private static RubyObjectAdapter rubyApi;
+    
+    private static final String[] TABLE_TYPE = new String[] { "TABLE" };
+    private static final String[] TABLE_TYPES = new String[] { "TABLE", "VIEW", "SYNONYM" };
 
     protected RubyJdbcConnection(Ruby runtime, RubyClass metaClass) {
         super(runtime, metaClass);
-    }
-
-    public static RubyClass createJdbcConnectionClass(Ruby runtime) {
-        RubyClass jdbcConnection = getConnectionAdapters(runtime).defineClassUnder("JdbcConnection",
-                runtime.getObject(), JDBCCONNECTION_ALLOCATOR);
-        jdbcConnection.defineAnnotatedMethods(RubyJdbcConnection.class);
-
-        rubyApi = JavaEmbedUtils.newObjectAdapter();
-
-        return jdbcConnection;
     }
 
     private static ObjectAllocator JDBCCONNECTION_ALLOCATOR = new ObjectAllocator() {
@@ -100,78 +92,218 @@ public class RubyJdbcConnection extends RubyObject {
             return new RubyJdbcConnection(runtime, klass);
         }
     };
+    
+    public static RubyClass createJdbcConnectionClass(final Ruby runtime) {
+        RubyClass jdbcConnection = getConnectionAdapters(runtime).
+            defineClassUnder("JdbcConnection", runtime.getObject(), JDBCCONNECTION_ALLOCATOR);
+        jdbcConnection.defineAnnotatedMethods(RubyJdbcConnection.class);
+        return jdbcConnection;
+    }
 
-    protected static RubyModule getConnectionAdapters(Ruby runtime) {
+    /**
+     * @param runtime
+     * @return <code>ActiveRecord::ConnectionAdapters</code>
+     */
+    protected static RubyModule getConnectionAdapters(final Ruby runtime) {
         return (RubyModule) runtime.getModule("ActiveRecord").getConstant("ConnectionAdapters");
     }
 
-    protected String[] getTableTypes() {
-        return TABLE_TYPES;
+    /**
+     * @param runtime
+     * @return <code>ActiveRecord::Result</code>
+     */
+    protected static RubyClass getResult(final Ruby runtime) {
+        return runtime.getModule("ActiveRecord").getClass("Result");
+    }
+    
+    /**
+     * @param runtime
+     * @return <code>ActiveRecord::ConnectionAdapters::IndexDefinition</code>
+     */
+    protected static RubyClass getIndexDefinition(final Ruby runtime) {
+        return getConnectionAdapters(runtime).getClass("IndexDefinition");
+    }
+    
+    /**
+     * @param runtime
+     * @return <code>ActiveRecord::TransactionIsolationError</code>
+     */
+    protected static RubyClass getJDBCError(final Ruby runtime) {
+        return runtime.getModule("ActiveRecord").getClass("JDBCError");
     }
 
-    @JRubyMethod(name = "begin")
-    public IRubyObject begin(ThreadContext context) throws SQLException {
-        final Ruby runtime = context.getRuntime();
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-          public Object call(Connection c) throws SQLException {
-            getConnection(true).setAutoCommit(false);
-            return runtime.getNil();
-          }
+    /**
+     * NOTE: Only available since AR-4.0
+     * @param runtime
+     * @return <code>ActiveRecord::TransactionIsolationError</code>
+     */
+    protected static RubyClass getTransactionIsolationError(final Ruby runtime) {
+        return (RubyClass) runtime.getModule("ActiveRecord").getConstant("TransactionIsolationError");
+    }
+    
+    /**
+     * @param runtime
+     * @return <code>ActiveRecord::ConnectionAdapters::JdbcTypeConverter</code>
+     */
+    private static RubyClass getJdbcTypeConverter(final Ruby runtime) {
+        return getConnectionAdapters(runtime).getClass("JdbcTypeConverter");
+    }
+    
+    /*
+      def transaction_isolation_levels
+        {
+          read_uncommitted: "READ UNCOMMITTED",
+          read_committed:   "READ COMMITTED",
+          repeatable_read:  "REPEATABLE READ",
+          serializable:     "SERIALIZABLE"
+        }
+      end 
+    */
+
+    public static int mapTransactionIsolationLevel(IRubyObject isolation) {
+        if ( ! ( isolation instanceof RubySymbol ) ) {
+            isolation = isolation.convertToString().callMethod("intern");
+        }
+        
+        final Object isolationString = isolation.toString(); // RubySymbol.toString
+        if ( isolationString == "read_uncommitted" ) return Connection.TRANSACTION_READ_UNCOMMITTED; // 1
+        if ( isolationString == "read_committed" ) return Connection.TRANSACTION_READ_COMMITTED; // 2
+        if ( isolationString == "repeatable_read" ) return Connection.TRANSACTION_REPEATABLE_READ; // 4
+        if ( isolationString == "serializable" ) return Connection.TRANSACTION_SERIALIZABLE; // 8
+        
+        throw new IllegalArgumentException(
+                "unexpected isolation level: " + isolation + " (" + isolationString + ")"
+        );
+    }
+
+    @JRubyMethod(name = "supports_transaction_isolation?", optional = 1)
+    public IRubyObject supports_transaction_isolation_p(final ThreadContext context, 
+        final IRubyObject[] args) throws SQLException {
+        final IRubyObject isolation = args.length > 0 ? args[0] : null;
+        
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final DatabaseMetaData metaData = connection.getMetaData();
+                final boolean supported;
+                if ( isolation != null && ! isolation.isNil() ) {
+                    final int level = mapTransactionIsolationLevel(isolation);
+                    supported = metaData.supportsTransactionIsolationLevel(level);
+                }
+                else {
+                    final int level = metaData.getDefaultTransactionIsolation();
+                    supported = level > Connection.TRANSACTION_NONE; // > 0
+                }
+                return context.getRuntime().newBoolean(supported);
+            }
         });
     }
-
-    @JRubyMethod(name = {"columns", "columns_internal"}, required = 1, optional = 2)
-    public IRubyObject columns_internal(final ThreadContext context, final IRubyObject[] args)
-            throws SQLException, IOException {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                ResultSet results = null, pkeys = null;
-                try {
-                    String defaultSchema = args.length > 2 ? toStringOrNull(args[2]) : null;
-                    String tableName = rubyApi.convertToRubyString(args[0]).getUnicodeValue();
-                    TableNameComponents components = extractTableNameComponents(c, defaultSchema, tableName);
-
-                    RubyArray matchingTables = (RubyArray) tableLookupBlock(context.getRuntime(),
-                            components.catalog, components.schema, components.table, getTableTypes(), false).call(c);
-                    if (matchingTables.isEmpty()) {
-                        throw new SQLException("Table " + tableName + " does not exist");
+    
+    @JRubyMethod(name = "begin", optional = 1) // optional isolation argument for AR-4.0
+    public IRubyObject begin(final ThreadContext context, final IRubyObject[] args) {
+        final IRubyObject isolation = args.length > 0 ? args[0] : null;
+        try { // handleException == false so we can handle setTXIsolation
+            return withConnection(context, false, new Callable<IRubyObject>() {
+                public IRubyObject call(final Connection connection) throws SQLException {
+                    connection.setAutoCommit(false);
+                    if ( isolation != null && ! isolation.isNil() ) {
+                        final int level = mapTransactionIsolationLevel(isolation);
+                        try {
+                            connection.setTransactionIsolation(level);
+                        } 
+                        catch (SQLException e) {
+                            RubyClass txError = getTransactionIsolationError(context.getRuntime());
+                            if ( txError != null ) throw wrapException(context, txError, e);
+                            throw e; // let it roll - will be wrapped into a JDBCError (non 4.0)
+                        }
                     }
-
-                    DatabaseMetaData metadata = c.getMetaData();
-                    results = metadata.getColumns(components.catalog, components.schema, components.table, null);
-                    pkeys = metadata.getPrimaryKeys(components.catalog, components.schema, components.table);
-                    return unmarshal_columns(context, metadata, results, pkeys);
-                } finally {
-                    close(results);
-                    close(pkeys);
+                    return context.getRuntime().getNil();
+                }
+            });
+        }
+        catch (SQLException e) {
+            return handleException(context, e);
+        }
+    }
+    
+    @JRubyMethod(name = "commit")
+    public IRubyObject commit(final ThreadContext context) {
+        final Connection connection = getConnection(true);
+        try {
+            if ( ! connection.getAutoCommit() ) {
+                try {
+                    connection.commit();
+                    return context.getRuntime().newBoolean(true);
+                }
+                finally {
+                    connection.setAutoCommit(true);
                 }
             }
-        });
+            return context.getRuntime().getNil();
+        }
+        catch (SQLException e) {
+            return handleException(context, e);
+        }
     }
 
-    @JRubyMethod(name = "commit")
-    public IRubyObject commit(ThreadContext context) throws SQLException {
-        Connection connection = getConnection(true);
-
-        if (!connection.getAutoCommit()) {
-            try {
-                connection.commit();
-            } finally {
-                connection.setAutoCommit(true);
+    @JRubyMethod(name = "rollback")
+    public IRubyObject rollback(final ThreadContext context) {
+        final Connection connection = getConnection(true);
+        try {
+            if ( ! connection.getAutoCommit() ) {
+                try {
+                    connection.rollback();
+                    return context.getRuntime().newBoolean(true);
+                } finally {
+                    connection.setAutoCommit(true);
+                }
+            }
+            return context.getRuntime().getNil();
+        }
+        catch (SQLException e) {
+            return handleException(context, e);
+        }
+    }
+    
+    @JRubyMethod(name = "connection")
+    public IRubyObject connection(final ThreadContext context) {
+        if ( getConnection(false) == null ) { 
+            synchronized (this) {
+                if ( getConnection(false) == null ) {
+                    reconnect(context);
+                }
             }
         }
-
-        return context.getRuntime().getNil();
-    }
-
-    @JRubyMethod(name = "connection", frame = false)
-    public IRubyObject connection() {
-        if (getConnection() == null) reconnect();
-
         return getInstanceVariable("@connection");
     }
 
-    @JRubyMethod(name = "database_name", frame = false)
+    @JRubyMethod(name = "disconnect!")
+    public IRubyObject disconnect(final ThreadContext context) {
+        // TODO: only here to try resolving multi-thread issues :
+        // https://github.com/jruby/activerecord-jdbc-adapter/issues/197
+        // https://github.com/jruby/activerecord-jdbc-adapter/issues/198
+        if ( Boolean.getBoolean("arjdbc.disconnect.debug") ) {
+            final Ruby runtime = context.getRuntime();
+            List backtrace = (List) context.createCallerBacktrace(runtime, 0);
+            runtime.getOut().println(this + " connection.disconnect! occured: ");
+            for ( Object element : backtrace ) { 
+                runtime.getOut().println(element);
+            }
+            runtime.getOut().flush();
+        }
+        return setConnection(null);
+    }
+
+    @JRubyMethod(name = "reconnect!")
+    public IRubyObject reconnect(final ThreadContext context) {
+        try {
+            return setConnection( getConnectionFactory().newConnection() );
+        }
+        catch (SQLException e) {
+            return handleException(context, e);
+        }
+    }
+    
+    @JRubyMethod(name = "database_name")
     public IRubyObject database_name(ThreadContext context) throws SQLException {
         Connection connection = getConnection(true);
         String name = connection.getCatalog();
@@ -185,32 +317,25 @@ public class RubyJdbcConnection extends RubyObject {
         return context.getRuntime().newString(name);
     }
 
-    @JRubyMethod(name = "disconnect!", frame = false)
-    public IRubyObject disconnect() {
-        return setConnection(null);
-    }
-
-    @JRubyMethod
+    @JRubyMethod(name = "execute", required = 1)
     public IRubyObject execute(final ThreadContext context, final IRubyObject sql) {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Statement stmt = null;
-                String query = rubyApi.convertToRubyString(sql).getUnicodeValue();
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                Statement statement = null;
+                final String query = sql.convertToString().getUnicodeValue();
                 try {
-                    stmt = c.createStatement();
-                    if (genericExecute(stmt, query)) {
-                        return unmarshalResults(context, c.getMetaData(), stmt, false);
+                    statement = connection.createStatement();
+                    if (genericExecute(statement, query)) {
+                        return unmarshalResults(context, connection.getMetaData(), statement, false);
                     } else {
-                        return unmarshalKeysOrUpdateCount(context, c, stmt);
+                        return unmarshalKeysOrUpdateCount(context, connection, statement);
                     }
-                } catch (SQLException sqe) {
-                    if (context.getRuntime().isDebug()) {
-                        System.out.println("Error SQL: " + query);
-                    }
-                    throw sqe;
-                } finally {
-                    close(stmt);
                 }
+                catch (final SQLException e) {
+                    debugErrorSQL(context, query);
+                    throw e;
+                }
+                finally { close(statement); }
             }
         });
     }
@@ -218,37 +343,37 @@ public class RubyJdbcConnection extends RubyObject {
     protected boolean genericExecute(Statement stmt, String query) throws SQLException {
         return stmt.execute(query);
     }
-
-    protected IRubyObject unmarshalKeysOrUpdateCount(ThreadContext context, Connection c, Statement stmt) throws SQLException {
-        IRubyObject key = context.getRuntime().getNil();
-        if (c.getMetaData().supportsGetGeneratedKeys()) {
-            key = unmarshal_id_result(context.getRuntime(), stmt.getGeneratedKeys());
+    
+    protected IRubyObject unmarshalKeysOrUpdateCount(
+            final ThreadContext context, final Connection connection, final Statement statement) throws SQLException {
+        final Ruby runtime = context.getRuntime();
+        final IRubyObject key;
+        if ( connection.getMetaData().supportsGetGeneratedKeys() ) {
+            key = unmarshalIdResult(runtime, statement);
         }
-        if (key.isNil()) {
-            return context.getRuntime().newFixnum(stmt.getUpdateCount());
-        } else {
-            return key;
+        else {
+            key = runtime.getNil();
         }
-    }
+        return key.isNil() ? runtime.newFixnum( statement.getUpdateCount() ) : key;
+     }
 
     @JRubyMethod(name = "execute_id_insert", required = 2)
-    public IRubyObject execute_id_insert(final ThreadContext context, final IRubyObject sql,
-            final IRubyObject id) throws SQLException {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                String insert = rubyApi.convertToRubyString(sql).getUnicodeValue();
-                PreparedStatement ps = c.prepareStatement(insert);
+    public IRubyObject execute_id_insert(final ThreadContext context, 
+        final IRubyObject sql, final IRubyObject id) throws SQLException {
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                PreparedStatement statement = null;
+                final String insertSQL = sql.convertToString().getUnicodeValue();
                 try {
-                    ps.setLong(1, RubyNumeric.fix2long(id));
-                    ps.executeUpdate();
-                } catch (SQLException sqe) {
-                    if (context.getRuntime().isDebug()) {
-                        System.out.println("Error SQL: " + insert);
-                    }
-                    throw sqe;
-                } finally {
-                    close(ps);
+                    statement = connection.prepareStatement(insertSQL);
+                    statement.setLong(1, RubyNumeric.fix2long(id));
+                    statement.executeUpdate();
                 }
+                catch (final SQLException e) {
+                    debugErrorSQL(context, insertSQL);
+                    throw e;
+                }
+                finally { close(statement); }
                 return id;
             }
         });
@@ -256,191 +381,75 @@ public class RubyJdbcConnection extends RubyObject {
 
     @JRubyMethod(name = "execute_insert", required = 1)
     public IRubyObject execute_insert(final ThreadContext context, final IRubyObject sql)
-            throws SQLException {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Statement stmt = null;
-                String insert = rubyApi.convertToRubyString(sql).getUnicodeValue();
+        throws SQLException {
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                Statement statement = null;
+                final String insertSQL = sql.convertToString().getUnicodeValue();
                 try {
-                    stmt = c.createStatement();
-                    stmt.executeUpdate(insert, Statement.RETURN_GENERATED_KEYS);
-                    return unmarshal_id_result(context.getRuntime(), stmt.getGeneratedKeys());
-                } catch (SQLException sqe) {
-                    if (context.getRuntime().isDebug()) {
-                        System.out.println("Error SQL: " + insert);
-                    }
-                    throw sqe;
-                } finally {
-                    close(stmt);
+                    statement = connection.createStatement();
+                    statement.executeUpdate(insertSQL, Statement.RETURN_GENERATED_KEYS);
+                    return unmarshal_id_result(context.getRuntime(), statement.getGeneratedKeys());
                 }
+                catch (final SQLException e) {
+                    debugErrorSQL(context, insertSQL);
+                    throw e;
+                }
+                finally { close(statement); }
             }
         });
     }
 
     @JRubyMethod(name = "execute_query", required = 1)
-    public IRubyObject execute_query(final ThreadContext context, IRubyObject _sql)
-            throws SQLException, IOException {
-        String sql = rubyApi.convertToRubyString(_sql).getUnicodeValue();
-
-        return executeQuery(context, sql, 0);
+    public IRubyObject execute_query(final ThreadContext context, IRubyObject sql)
+        throws SQLException {
+        String query = sql.convertToString().getUnicodeValue();
+        return executeQuery(context, query, 0);
     }
 
     @JRubyMethod(name = "execute_query", required = 2)
-    public IRubyObject execute_query(final ThreadContext context, IRubyObject _sql,
-            IRubyObject _maxRows) throws SQLException, IOException {
-        String sql = rubyApi.convertToRubyString(_sql).getUnicodeValue();
-        int maxrows = RubyNumeric.fix2int(_maxRows);
-
-        return executeQuery(context, sql, maxrows);
+    public IRubyObject execute_query(final ThreadContext context, 
+        final IRubyObject sql, final IRubyObject maxRows) throws SQLException {
+        final String query = sql.convertToString().getUnicodeValue();
+        return executeQuery(context, query, RubyNumeric.fix2int(maxRows));
     }
 
     protected IRubyObject executeQuery(final ThreadContext context, final String query, final int maxRows) {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Statement stmt = null;
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final Ruby runtime = context.getRuntime();
+                Statement statement = null;
                 try {
-                    DatabaseMetaData metadata = c.getMetaData();
-                    stmt = c.createStatement();
-                    stmt.setMaxRows(maxRows);
-                    return unmarshalResult(context, metadata, stmt.executeQuery(query), false);
-                } catch (SQLException sqe) {
-                    if (context.getRuntime().isDebug()) {
-                        System.out.println("Error SQL: " + query);
-                    }
-                    throw sqe;
-                } finally {
-                    close(stmt);
+                    final DatabaseMetaData metaData = connection.getMetaData();
+                    statement = connection.createStatement();
+                    statement.setMaxRows(maxRows);
+                    return unmarshalResult(context, runtime, metaData, statement.executeQuery(query), false);
                 }
+                catch (final SQLException e) {
+                    debugErrorSQL(context, query);
+                    throw e;
+                }
+                finally { close(statement); }
             }
         });
     }
-
-    @JRubyMethod(name = "execute_update", required = 1)
+    
+    @JRubyMethod(name = {"execute_update", "execute_delete"}, required = 1)
     public IRubyObject execute_update(final ThreadContext context, final IRubyObject sql)
-            throws SQLException {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Statement stmt = null;
-                String update = rubyApi.convertToRubyString(sql).getUnicodeValue();
+        throws SQLException {
+        return withConnection(context, new Callable<RubyInteger>() {
+            public RubyInteger call(final Connection connection) throws SQLException {
+                Statement statement = null;
+                final String updateSQL = sql.convertToString().getUnicodeValue();
                 try {
-                    stmt = c.createStatement();
-                    return context.getRuntime().newFixnum((long)stmt.executeUpdate(update));
-                } catch (SQLException sqe) {
-                    if (context.getRuntime().isDebug()) {
-                        System.out.println("Error SQL: " + update);
-                    }
-                    throw sqe;
-                } finally {
-                    close(stmt);
+                    statement = connection.createStatement();
+                    return context.getRuntime().newFixnum(statement.executeUpdate(updateSQL));
                 }
-            }
-        });
-    }
-
-    @JRubyMethod(name = "indexes")
-    public IRubyObject indexes(ThreadContext context, IRubyObject tableName, IRubyObject name, IRubyObject schemaName) {
-        return indexes(context, toStringOrNull(tableName), toStringOrNull(name), toStringOrNull(schemaName));
-    }
-
-    private static final int INDEX_TABLE_NAME = 3;
-    private static final int INDEX_NON_UNIQUE = 4;
-    private static final int INDEX_NAME = 6;
-    private static final int INDEX_COLUMN_NAME = 9;
-
-    /**
-     * Default JDBC introspection for index metadata on the JdbcConnection.
-     *
-     * JDBC index metadata is denormalized (multiple rows may be returned for
-     * one index, one row per column in the index), so a simple block-based
-     * filter like that used for tables doesn't really work here.  Callers
-     * should filter the return from this method instead.
-     */
-    protected IRubyObject indexes(final ThreadContext context, final String tableNameArg, final String name, final String schemaNameArg) {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Ruby runtime = context.getRuntime();
-                DatabaseMetaData metadata = c.getMetaData();
-                String tableName = caseConvertIdentifierForJdbc(metadata, tableNameArg);
-                String schemaName = caseConvertIdentifierForJdbc(metadata, schemaNameArg);
-
-                ResultSet resultSet = null;
-                List indexes = new ArrayList();
-                try {
-                    resultSet = metadata.getIndexInfo(null, schemaName, tableName, false, true);
-                    List primaryKeys = primaryKeys(context, tableName);
-                    String currentIndex = null;
-                    RubyModule indexDefinitionClass = getConnectionAdapters(runtime).getClass("IndexDefinition");
-
-                    while (resultSet.next()) {
-                        String indexName = resultSet.getString(INDEX_NAME);
-
-                        if (indexName == null) continue;
-
-                        indexName = caseConvertIdentifierForRails(metadata, indexName);
-
-                        RubyString columnName = RubyString.newUnicodeString(runtime, caseConvertIdentifierForRails(metadata, resultSet.getString(INDEX_COLUMN_NAME)));
-
-                        if (primaryKeys.contains(columnName)) continue;
-
-                        // We are working on a new index
-                        if (!indexName.equals(currentIndex)) {
-                            currentIndex = indexName;
-
-                            tableName = caseConvertIdentifierForRails(metadata, resultSet.getString(INDEX_TABLE_NAME));
-                            boolean nonUnique = resultSet.getBoolean(INDEX_NON_UNIQUE);
-
-                            IRubyObject indexDefinition = indexDefinitionClass.callMethod(context, "new",
-                                    new IRubyObject[] {
-                                RubyString.newUnicodeString(runtime, tableName),
-                                RubyString.newUnicodeString(runtime, indexName),
-                                runtime.newBoolean(!nonUnique),
-                                runtime.newArray()
-                            });
-
-                            // empty list for column names, we'll add to that in just a bit
-                            indexes.add(indexDefinition);
-                        }
-
-                        // One or more columns can be associated with an index
-                        IRubyObject lastIndex = (IRubyObject) indexes.get(indexes.size() - 1);
-
-                        if (lastIndex != null) {
-                            lastIndex.callMethod(context, "columns").callMethod(context, "<<", columnName);
-                        }
-                    }
-
-                    return runtime.newArray(indexes);
-                } finally {
-                    close(resultSet);
+                catch (final SQLException e) {
+                    debugErrorSQL(context, updateSQL);
+                    throw e;
                 }
-            }
-        });
-    }
-
-    @JRubyMethod(name = "insert?", required = 1, meta = true, frame = false)
-    public static IRubyObject insert_p(ThreadContext context, IRubyObject recv, IRubyObject _sql) {
-        ByteList sql = rubyApi.convertToRubyString(_sql).getByteList();
-
-        return context.getRuntime().newBoolean(startsWithNoCaseCmp(sql, INSERT));
-    }
-
-    /*
-     * sql, values, types, name = nil, pk = nil, id_value = nil, sequence_name = nil
-     */
-    @JRubyMethod(name = "insert_bind", required = 3, rest = true)
-    public IRubyObject insert_bind(final ThreadContext context, final IRubyObject[] args) throws SQLException {
-        final Ruby runtime = context.getRuntime();
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                PreparedStatement ps = null;
-                try {
-                    ps = c.prepareStatement(rubyApi.convertToRubyString(args[0]).toString(), Statement.RETURN_GENERATED_KEYS);
-                    setValuesOnPS(ps, context, args[1], args[2]);
-                    ps.executeUpdate();
-                    return unmarshal_id_result(runtime, ps.getGeneratedKeys());
-                } finally {
-                    close(ps);
-                }
+                finally { close(statement); }
             }
         });
     }
@@ -453,76 +462,46 @@ public class RubyJdbcConnection extends RubyObject {
 
     @JRubyMethod(name = "primary_keys", required = 1)
     public IRubyObject primary_keys(ThreadContext context, IRubyObject tableName) throws SQLException {
-        return context.getRuntime().newArray(primaryKeys(context, tableName.toString()));
+        @SuppressWarnings("unchecked")
+        List<IRubyObject> primaryKeys = (List) primaryKeys(context, tableName.toString());
+        return context.getRuntime().newArray(primaryKeys);
     }
 
-    protected List primaryKeys(final ThreadContext context, final String tableNameArg) {
-        return (List) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                Ruby runtime = context.getRuntime();
-                DatabaseMetaData metadata = c.getMetaData();
-                String tableName = caseConvertIdentifierForJdbc(metadata, tableNameArg);
+    private static final int PRIMARY_KEYS_COLUMN_NAME = 4;
+    
+    protected List<RubyString> primaryKeys(final ThreadContext context, final String tableName) {
+        return withConnection(context, new Callable<List<RubyString>>() {
+            public List<RubyString> call(final Connection connection) throws SQLException {
+                final Ruby runtime = context.getRuntime();
+                final DatabaseMetaData metaData = connection.getMetaData();
+                final String _tableName = caseConvertIdentifierForJdbc(metaData, tableName);
                 ResultSet resultSet = null;
-                List keyNames = new ArrayList();
+                final List<RubyString> keyNames = new ArrayList<RubyString>();
                 try {
-                    TableNameComponents components = extractTableNameComponents(c, null, tableName);
-                    resultSet = metadata.getPrimaryKeys(components.catalog, components.schema, components.table);
+                    TableName components = extractTableName(connection, null, _tableName);
+                    resultSet = metaData.getPrimaryKeys(components.catalog, components.schema, components.name);
 
                     while (resultSet.next()) {
-                        keyNames.add(RubyString.newUnicodeString(runtime,
-                                caseConvertIdentifierForRails(metadata, resultSet.getString(4))));
+                        String columnName = resultSet.getString(PRIMARY_KEYS_COLUMN_NAME);
+                        columnName = caseConvertIdentifierForRails(metaData, columnName);
+                        keyNames.add( RubyString.newUnicodeString(runtime, columnName) );
                     }
-                } finally {
-                    close(resultSet);
                 }
-
+                finally { close(resultSet); }
                 return keyNames;
             }
         });
     }
-
-    @JRubyMethod(name = "reconnect!")
-    public IRubyObject reconnect() {
-        return setConnection(getConnectionFactory().newConnection());
-    }
-
-
-    @JRubyMethod(name = "rollback")
-    public IRubyObject rollback(ThreadContext context) throws SQLException {
-        final Ruby runtime = context.getRuntime();
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-          public Object call(Connection c) throws SQLException {
-            Connection connection = getConnection(true);
-
-            if (!connection.getAutoCommit()) {
-                try {
-                    connection.rollback();
-                } finally {
-                    connection.setAutoCommit(true);
-                }
-            }
-
-            return runtime.getNil();
-          }
-        });
-    }
-
-    @JRubyMethod(name = "select?", required = 1, meta = true, frame = false)
-    public static IRubyObject select_p(ThreadContext context, IRubyObject recv, IRubyObject _sql) {
-        ByteList sql = rubyApi.convertToRubyString(_sql).getByteList();
-
-        return context.getRuntime().newBoolean(startsWithNoCaseCmp(sql, SELECT) ||
-                startsWithNoCaseCmp(sql, SHOW) || startsWithNoCaseCmp(sql, CALL));
-    }
-
+    
     @JRubyMethod(name = "set_native_database_types")
-    public IRubyObject set_native_database_types(ThreadContext context) throws SQLException, IOException {
-        Ruby runtime = context.getRuntime();
-        DatabaseMetaData metadata = getConnection(true).getMetaData();
-        IRubyObject types = unmarshalResult(context, metadata, metadata.getTypeInfo(), true);
-        IRubyObject typeConverter = getConnectionAdapters(runtime).getConstant("JdbcTypeConverter");
-        IRubyObject value = rubyApi.callMethod(rubyApi.callMethod(typeConverter, "new", types), "choose_best_types");
-        setInstanceVariable("@native_types", value);
+    public IRubyObject set_native_database_types(final ThreadContext context) 
+        throws SQLException { // TODO we should handle exceptions !
+        final Ruby runtime = context.getRuntime();
+        final DatabaseMetaData metaData = getConnection(true).getMetaData();
+        IRubyObject types = unmarshalResult(context, runtime, metaData, metaData.getTypeInfo(), true);
+        
+        IRubyObject typeConverter = getJdbcTypeConverter(runtime).callMethod("new", types);
+        setInstanceVariable("@native_types", typeConverter.callMethod(context, "choose_best_types"));
 
         return runtime.getNil();
     }
@@ -552,27 +531,195 @@ public class RubyJdbcConnection extends RubyObject {
         return tables(context, toStringOrNull(args[0]), toStringOrNull(args[1]), toStringOrNull(args[2]), getTypes(args[3]));
     }
 
-    protected IRubyObject tables(ThreadContext context, String catalog, String schemaPattern, String tablePattern, String[] types) {
-        return (IRubyObject) withConnectionAndRetry(context, tableLookupBlock(context.getRuntime(), catalog, schemaPattern, tablePattern, types, false));
+    protected IRubyObject tables(final ThreadContext context, 
+        final String catalog, final String schemaPattern, final String tablePattern, final String[] types) {
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                return matchTables(context.getRuntime(), connection, catalog, schemaPattern, tablePattern, types, false);
+            }
+        });
     }
 
+    protected String[] getTableTypes() {
+        return TABLE_TYPES;
+    }
+
+    @JRubyMethod(name = "table_exists?", required = 1, optional = 1)
+    public IRubyObject table_exists_p(final ThreadContext context, final IRubyObject[] args) {
+        IRubyObject name = args[0], schema_name = args.length > 1 ? args[1] : null;
+        if ( ! ( name instanceof RubyString ) ) {
+            name = name.callMethod(context, "to_s");
+        }
+        final String tableName = ((RubyString) name).getUnicodeValue();
+        final String tableSchema = schema_name == null ? null : schema_name.convertToString().getUnicodeValue();
+        final Ruby runtime = context.getRuntime();
+        
+        return withConnection(context, new Callable<RubyBoolean>() {
+            public RubyBoolean call(final Connection connection) throws SQLException {
+                final TableName components = extractTableName(connection, tableSchema, tableName);
+                return runtime.newBoolean( tableExists(runtime, connection, components) );
+            }
+        });
+    }
+    
+    @JRubyMethod(name = {"columns", "columns_internal"}, required = 1, optional = 2)
+    public IRubyObject columns_internal(final ThreadContext context, final IRubyObject[] args)
+        throws SQLException {
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                ResultSet columns = null, primaryKeys = null;
+                try {
+                    final String tableName = args[0].convertToString().getUnicodeValue();
+                    // optionals (NOTE: catalog argumnet was never used before 1.3.0) :
+                    final String catalog = args.length > 1 ? toStringOrNull(args[1]) : null;
+                    final String defaultSchema = args.length > 2 ? toStringOrNull(args[2]) : null;
+                    
+                    final TableName components;
+                    if ( catalog == null ) { // backwards-compatibility with < 1.3.0
+                        components = extractTableName(connection, defaultSchema, tableName);
+                    }
+                    else {
+                        components = extractTableName(connection, catalog, defaultSchema, tableName);
+                    }
+                    
+                    if ( ! tableExists(context.getRuntime(), connection, components) ) {
+                        throw new SQLException("table: " + tableName + " does not exist");
+                    }
+
+                    final DatabaseMetaData metaData = connection.getMetaData();
+                    columns = metaData.getColumns(components.catalog, components.schema, components.name, null);
+                    primaryKeys = metaData.getPrimaryKeys(components.catalog, components.schema, components.name);
+                    return unmarshalColumns(context, metaData, columns, primaryKeys);
+                }
+                finally {
+                    close(columns);
+                    close(primaryKeys);
+                }
+            }
+        });
+    }
+    
+    @JRubyMethod(name = "indexes")
+    public IRubyObject indexes(ThreadContext context, IRubyObject tableName, IRubyObject name, IRubyObject schemaName) {
+        return indexes(context, toStringOrNull(tableName), toStringOrNull(name), toStringOrNull(schemaName));
+    }
+
+    // NOTE: metaData.getIndexInfo row mappings :
+    private static final int INDEX_INFO_TABLE_NAME = 3;
+    private static final int INDEX_INFO_NON_UNIQUE = 4;
+    private static final int INDEX_INFO_NAME = 6;
+    private static final int INDEX_INFO_COLUMN_NAME = 9;
+
+    /**
+     * Default JDBC introspection for index metadata on the JdbcConnection.
+     *
+     * JDBC index metadata is denormalized (multiple rows may be returned for
+     * one index, one row per column in the index), so a simple block-based
+     * filter like that used for tables doesn't really work here.  Callers
+     * should filter the return from this method instead.
+     */
+    protected IRubyObject indexes(final ThreadContext context, final String tableName, final String name, final String schemaName) {
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final Ruby runtime = context.getRuntime();
+                final RubyClass indexDefinition = getIndexDefinition(runtime);
+                
+                final DatabaseMetaData metaData = connection.getMetaData();
+                String _tableName = caseConvertIdentifierForJdbc(metaData, tableName);
+                String _schemaName = caseConvertIdentifierForJdbc(metaData, schemaName);
+                
+                final List<RubyString> primaryKeys = primaryKeys(context, _tableName);
+                ResultSet indexInfoSet = null;
+                final List<IRubyObject> indexes = new ArrayList<IRubyObject>();
+                try {
+                    indexInfoSet = metaData.getIndexInfo(null, _schemaName, _tableName, false, true);
+                    String currentIndex = null;
+
+                    while ( indexInfoSet.next() ) {
+                        String indexName = indexInfoSet.getString(INDEX_INFO_NAME);
+                        if ( indexName == null ) continue;
+                        indexName = caseConvertIdentifierForRails(metaData, indexName);
+
+                        final String columnName = indexInfoSet.getString(INDEX_INFO_COLUMN_NAME);
+                        final RubyString rubyColumnName = RubyString.newUnicodeString(
+                                runtime, caseConvertIdentifierForRails(metaData, columnName)
+                        );
+                        if ( primaryKeys.contains(rubyColumnName) ) continue;
+
+                        // We are working on a new index
+                        if ( ! indexName.equals(currentIndex) ) {
+                            currentIndex = indexName;
+
+                            String indexTableName = indexInfoSet.getString(INDEX_INFO_TABLE_NAME);
+                            indexTableName = caseConvertIdentifierForRails(metaData, indexTableName);
+                            
+                            final boolean nonUnique = indexInfoSet.getBoolean(INDEX_INFO_NON_UNIQUE);
+                            
+                            IRubyObject[] args = new IRubyObject[] {
+                                RubyString.newUnicodeString(runtime, indexTableName), // table_name
+                                RubyString.newUnicodeString(runtime, indexName), // index_name
+                                runtime.newBoolean( ! nonUnique ), // unique
+                                runtime.newArray() // [] for column names, we'll add to that in just a bit
+                            };
+
+                            indexes.add( indexDefinition.callMethod(context, "new", args) ); // IndexDefinition.new
+                        }
+
+                        // One or more columns can be associated with an index
+                        IRubyObject lastIndexDef = indexes.isEmpty() ? null : indexes.get(indexes.size() - 1);
+                        if (lastIndexDef != null) {
+                            lastIndexDef.callMethod(context, "columns").callMethod(context, "<<", rubyColumnName);
+                        }
+                    }
+
+                    return runtime.newArray(indexes);
+                    
+                } finally { close(indexInfoSet); }
+            }
+        });
+    }
+    
+    // NOTE: this seems to be not used ... at all, deprecate ?
+    /*
+     * sql, values, types, name = nil, pk = nil, id_value = nil, sequence_name = nil
+     */
+    @JRubyMethod(name = "insert_bind", required = 3, rest = true)
+    public IRubyObject insert_bind(final ThreadContext context, final IRubyObject[] args) throws SQLException {
+        final Ruby runtime = context.getRuntime();
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final String sql = args[0].convertToString().toString();
+                PreparedStatement statement = null;
+                try {
+                    statement = connection.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS);
+                    setValues(context, args[1], args[2], statement);
+                    statement.executeUpdate();
+                    return unmarshalIdResult(runtime, statement);
+                }
+                finally { close(statement); }
+            }
+        });
+    }
+    
+    // NOTE: this seems to be not used ... at all, deprecate ?
     /*
      * sql, values, types, name = nil
      */
+    @Deprecated
     @JRubyMethod(name = "update_bind", required = 3, rest = true)
     public IRubyObject update_bind(final ThreadContext context, final IRubyObject[] args) throws SQLException {
         final Ruby runtime = context.getRuntime();
         Arity.checkArgumentCount(runtime, args, 3, 4);
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                PreparedStatement ps = null;
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final String sql = args[0].convertToString().toString();
+                PreparedStatement statement = null;
                 try {
-                    ps = c.prepareStatement(rubyApi.convertToRubyString(args[0]).toString());
-                    setValuesOnPS(ps, context, args[1], args[2]);
-                    ps.executeUpdate();
-                } finally {
-                    close(ps);
+                    statement = connection.prepareStatement(sql);
+                    setValues(context, args[1], args[2], statement);
+                    statement.executeUpdate();
                 }
+                finally { close(statement); }
                 return runtime.getNil();
             }
         });
@@ -580,41 +727,48 @@ public class RubyJdbcConnection extends RubyObject {
 
     @JRubyMethod(name = "with_connection_retry_guard", frame = true)
     public IRubyObject with_connection_retry_guard(final ThreadContext context, final Block block) {
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                return block.call(context, new IRubyObject[] { wrappedConnection(c) });
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                return block.call(context, new IRubyObject[] { convertJavaToRuby(connection) });
             }
         });
     }
 
     /*
-     * (is binary?, colname, tablename, primary key, id, value)
+     * (is binary?, colname, tablename, primary_key, id, lob_value)
      */
     @JRubyMethod(name = "write_large_object", required = 6)
-    public IRubyObject write_large_object(ThreadContext context, final IRubyObject[] args)
-            throws SQLException, IOException {
+    public IRubyObject write_large_object(final ThreadContext context, final IRubyObject[] args)
+        throws SQLException {
+        
+        final boolean isBinary = args[0].isTrue(); 
+        final RubyString columnName = args[1].convertToString();
+        final RubyString tableName = args[2].convertToString();
+        final RubyString idKey = args[3].convertToString();
+        final RubyString idVal = args[4].convertToString();
+        final IRubyObject lobValue = args[5];
+        
         final Ruby runtime = context.getRuntime();
-        return (IRubyObject) withConnectionAndRetry(context, new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                String sql = "UPDATE " + rubyApi.convertToRubyString(args[2])
-                        + " SET " + rubyApi.convertToRubyString(args[1])
-                        + " = ? WHERE " + rubyApi.convertToRubyString(args[3])
-                        + "=" + rubyApi.convertToRubyString(args[4]);
-                PreparedStatement ps = null;
+        return withConnection(context, new Callable<IRubyObject>() {
+            public IRubyObject call(final Connection connection) throws SQLException {
+                final String sql = "UPDATE "+ tableName +
+                    " SET "+ columnName +" = ? WHERE "+ idKey +" = "+ idVal;
+                PreparedStatement statement = null;
                 try {
-                    ps = c.prepareStatement(sql);
-                    if (args[0].isTrue()) { // binary
-                        ByteList outp = rubyApi.convertToRubyString(args[5]).getByteList();
-                        ps.setBinaryStream(1, new ByteArrayInputStream(outp.bytes,
-                                outp.begin, outp.realSize), outp.realSize);
+                    statement = connection.prepareStatement(sql);
+                    if ( isBinary ) { // binary
+                        final ByteList blob = lobValue.convertToString().getByteList();
+                        final int realSize = blob.getRealSize();
+                        statement.setBinaryStream(1, 
+                            new ByteArrayInputStream(blob.unsafeBytes(), blob.getBegin(), realSize), realSize
+                        );
                     } else { // clob
-                        String ss = rubyApi.convertToRubyString(args[5]).getUnicodeValue();
-                        ps.setCharacterStream(1, new StringReader(ss), ss.length());
+                        String clob = lobValue.convertToString().getUnicodeValue();
+                        statement.setCharacterStream(1, new StringReader(clob), clob.length());
                     }
-                    ps.executeUpdate();
-                } finally {
-                    close(ps);
+                    statement.executeUpdate();
                 }
+                finally { close(statement); }
                 return runtime.getNil();
             }
         });
@@ -631,11 +785,11 @@ public class RubyJdbcConnection extends RubyObject {
      * Assumption 2: It is always safe to convert all upper case names since it appears that
      * some adapters do not report StoresUpper/Lower/Mixed correctly (am I right postgres/mysql?).
      */
-    public static String caseConvertIdentifierForRails(DatabaseMetaData metadata, String value)
-            throws SQLException {
-        if (value == null) return null;
-
-        return metadata.storesUpperCaseIdentifiers() ? value.toLowerCase() : value;
+    protected static String caseConvertIdentifierForRails(final DatabaseMetaData metaData, final String value)
+        throws SQLException {
+        if ( value == null ) return null;
+        
+        return metaData.storesUpperCaseIdentifiers() ? value.toLowerCase() : value;
     }
 
     /**
@@ -643,72 +797,35 @@ public class RubyJdbcConnection extends RubyObject {
      * storage case.  Methods like DatabaseMetaData.getPrimaryKeys() needs the table name to match
      * the internal storage name.  Arbtrary queries and the like DO NOT need to do this.
      */
-    public static String caseConvertIdentifierForJdbc(DatabaseMetaData metadata, String value)
-            throws SQLException {
-        if (value == null) return null;
-        boolean isPostgres = metadata.getDatabaseProductName().equals("PostgreSQL");
-
-        if (metadata.storesUpperCaseIdentifiers()) {
+    protected String caseConvertIdentifierForJdbc(final DatabaseMetaData metaData, final String value)
+        throws SQLException {
+        if ( value == null ) return null;
+        
+        if ( metaData.storesUpperCaseIdentifiers() ) {
             return value.toUpperCase();
-        } else if (metadata.storesLowerCaseIdentifiers() && ! isPostgres) {
+        }
+        else if ( metaData.storesLowerCaseIdentifiers() ) {
             return value.toLowerCase();
         }
 
         return value;
     }
 
-    // helpers
-    protected static void close(Connection connection) {
-        if (connection != null) {
-            try {
-                connection.close();
-            } catch(Exception e) {}
-        }
+    protected IRubyObject getConfigValue(final ThreadContext context, final String key) {
+        final IRubyObject config = getInstanceVariable("@config");
+        return config.callMethod(context, "[]", context.getRuntime().newSymbol(key));
     }
-
-    public static void close(ResultSet resultSet) {
-        if (resultSet != null) {
-            try {
-                resultSet.close();
-            } catch(Exception e) {}
-        }
-    }
-
-    public static void close(Statement statement) {
-        if (statement != null) {
-            try {
-                statement.close();
-            } catch(Exception e) {}
-        }
-    }
-
+    
+    /**
+     * @deprecated renamed to {@link #getConfigValue(ThreadContext, String)}
+     */
+    @Deprecated
     protected IRubyObject config_value(ThreadContext context, String key) {
-        IRubyObject config_hash = getInstanceVariable("@config");
-
-        return config_hash.callMethod(context, "[]", context.getRuntime().newSymbol(key));
+        return getConfigValue(context, key);
     }
 
     private static String toStringOrNull(IRubyObject arg) {
         return arg.isNil() ? null : arg.toString();
-    }
-
-    protected IRubyObject doubleToRuby(Ruby runtime, ResultSet resultSet, double doubleValue)
-            throws SQLException, IOException {
-        if (doubleValue == 0 && resultSet.wasNull()) return runtime.getNil();
-        return runtime.newFloat(doubleValue);
-    }
-
-    protected Connection getConnection() {
-        return getConnection(false);
-    }
-
-    protected Connection getConnection(boolean error) {
-        Connection conn = (Connection) dataGetStruct();
-        if(error && conn == null) {
-            RubyClass err = getRuntime().getModule("ActiveRecord").getClass("ConnectionNotEstablished");
-            throw new RaiseException(getRuntime(), err, "no connection available", false);
-        }
-        return conn;
     }
 
     protected IRubyObject getAdapter(ThreadContext context) {
@@ -721,328 +838,525 @@ public class RubyJdbcConnection extends RubyObject {
 
     protected JdbcConnectionFactory getConnectionFactory() throws RaiseException {
         IRubyObject connection_factory = getInstanceVariable("@connection_factory");
-        JdbcConnectionFactory factory = null;
-        try {
-            factory = (JdbcConnectionFactory) JavaEmbedUtils.rubyToJava(
-                    connection_factory.getRuntime(), connection_factory, JdbcConnectionFactory.class);
-        } catch (Exception e) {
-            factory = null;
+        if (connection_factory == null) {
+            throw getRuntime().newRuntimeError("@connection_factory not set");
         }
-        if (factory == null) {
+        JdbcConnectionFactory connectionFactory;
+        try {
+            connectionFactory = (JdbcConnectionFactory) 
+                connection_factory.toJava(JdbcConnectionFactory.class);
+        }
+        catch (Exception e) { // TODO debug this !
+            connectionFactory = null;
+        }
+        if (connectionFactory == null) {
             throw getRuntime().newRuntimeError("@connection_factory not set properly");
         }
-        return factory;
+        return connectionFactory;
     }
 
-    private static String[] getTypes(IRubyObject typeArg) {
-        if (!(typeArg instanceof RubyArray)) return new String[] { typeArg.toString() };
-
-        IRubyObject[] arr = rubyApi.convertToJavaArray(typeArg);
-        String[] types = new String[arr.length];
-        for (int i = 0; i < types.length; i++) {
-            types[i] = arr[i].toString();
+    private static String[] getTypes(final IRubyObject typeArg) {
+        if ( typeArg instanceof RubyArray ) {
+            IRubyObject[] rubyTypes = ((RubyArray) typeArg).toJavaArray();
+            
+            final String[] types = new String[rubyTypes.length];
+            for ( int i = 0; i < types.length; i++ ) {
+                types[i] = rubyTypes[i].toString();
+            }
+            return types;
         }
-
-        return types;
+        return new String[] { typeArg.toString() }; // expect a RubyString
     }
-
-    private static int getTypeValueFor(Ruby runtime, IRubyObject type) throws SQLException {
-        // How could this ever yield anything useful?
-        if (!(type instanceof RubySymbol)) type = rubyApi.callMethod(type, "class");
-
-        // Assumption; If this is a symbol then it will be backed by an interned string. (enebo)
-        String internedValue = type.asJavaString();
-
-        if(internedValue == "string") {
-            return Types.VARCHAR;
-        } else if(internedValue == "text") {
-            return Types.CLOB;
-        } else if(internedValue == "integer") {
-            return Types.INTEGER;
-        } else if(internedValue == "decimal") {
-            return Types.DECIMAL;
-        } else if(internedValue == "float") {
-            return Types.FLOAT;
-        } else if(internedValue == "datetime") {
-            return Types.TIMESTAMP;
-        } else if(internedValue == "timestamp") {
-            return Types.TIMESTAMP;
-        } else if(internedValue == "time") {
-            return Types.TIME;
-        } else if(internedValue == "date") {
-            return Types.DATE;
-        } else if(internedValue == "binary") {
-            return Types.BLOB;
-        } else if(internedValue == "boolean") {
-            return Types.BOOLEAN;
-        } else {
-            return -1;
-        }
-    }
-
-    private boolean isConnectionBroken(ThreadContext context, Connection c) {
-        try {
-            IRubyObject alive = config_value(context, "connection_alive_sql");
-            if (select_p(context, this, alive).isTrue()) {
-                String connectionSQL = rubyApi.convertToRubyString(alive).toString();
-                Statement s = c.createStatement();
-                try {
-                    s.execute(connectionSQL);
-                } finally {
-                    close(s);
+    
+    private static int jdbcTypeFor(final ThreadContext context, IRubyObject type) 
+        throws SQLException {
+        if ( ! ( type instanceof RubySymbol ) ) {
+            if ( type instanceof RubyString ) { // to_sym
+                if ( context.getRuntime().is1_9() ) {
+                    type = ( (RubyString) type ).intern19();
                 }
-                return false;
-            } else {
-                return !c.isClosed();
+                else {
+                    type = ( (RubyString) type ).intern();
+                }
             }
-        } catch (Exception sx) {
-            return true;
-        }
-    }
-
-    protected IRubyObject integerToRuby(Ruby runtime, ResultSet resultSet, long longValue)
-            throws SQLException {
-        if (longValue == 0 && resultSet.wasNull()) return runtime.getNil();
-
-        return runtime.newFixnum(longValue);
-    }
-
-    protected IRubyObject bigIntegerToRuby(Ruby runtime, ResultSet resultSet, String bigint) throws SQLException {
-        if (bigint == null && resultSet.wasNull()) return runtime.getNil();
-
-        return RubyBignum.bignorm(runtime, new BigInteger(bigint));
-    }
-
-    protected IRubyObject jdbcToRuby(Ruby runtime, int column, int type, ResultSet resultSet)
-            throws SQLException {
-        try {
-            switch (type) {
-            case Types.BINARY:
-            case Types.BLOB:
-            case Types.LONGVARBINARY:
-            case Types.VARBINARY:
-                return streamToRuby(runtime, resultSet, resultSet.getBinaryStream(column));
-            case Types.LONGVARCHAR:
-                return runtime.is1_9() ?
-                    readerToRuby(runtime, resultSet, resultSet.getCharacterStream(column)) :
-                    streamToRuby(runtime, resultSet, resultSet.getBinaryStream(column));
-            case Types.CLOB:
-                return readerToRuby(runtime, resultSet, resultSet.getCharacterStream(column));
-            case Types.TIMESTAMP:
-                return timestampToRuby(runtime, resultSet, resultSet.getTimestamp(column));
-            case Types.INTEGER:
-            case Types.SMALLINT:
-            case Types.TINYINT:
-                return integerToRuby(runtime, resultSet, resultSet.getLong(column));
-            case Types.REAL:
-                return doubleToRuby(runtime, resultSet, resultSet.getDouble(column));
-            case Types.BIGINT:
-                return bigIntegerToRuby(runtime, resultSet, resultSet.getString(column));
-            default:
-                return stringToRuby(runtime, resultSet, resultSet.getString(column));
+            else {
+                throw new IllegalArgumentException(
+                    "expected a Ruby string/symbol but got: " + type + " (" + type.getMetaClass().getName() + ")"
+                );
             }
-        } catch (IOException ioe) {
-            throw (SQLException) new SQLException(ioe.getMessage()).initCause(ioe);
         }
+        
+        final String internedValue = type.asJavaString();
+
+        if ( internedValue == (Object) "string" ) return Types.VARCHAR;
+        else if ( internedValue == (Object) "text" ) return Types.CLOB;
+        else if ( internedValue == (Object) "integer" ) return Types.INTEGER;
+        else if ( internedValue == (Object) "decimal" ) return Types.DECIMAL;
+        else if ( internedValue == (Object) "float" ) return Types.FLOAT;
+        else if ( internedValue == (Object) "datetime") return Types.TIMESTAMP;
+        else if ( internedValue == (Object) "timestamp" ) return Types.TIMESTAMP;
+        else if ( internedValue == (Object) "time" ) return Types.TIME;
+        else if ( internedValue == (Object) "date" ) return Types.DATE;
+        else if ( internedValue == (Object) "binary" ) return Types.BLOB;
+        else if ( internedValue == (Object) "boolean" ) return Types.BOOLEAN;
+        else if ( internedValue == (Object) "xml" ) return Types.SQLXML;
+        else if ( internedValue == (Object) "array" ) return Types.ARRAY;
+        else return -1;
     }
 
-    protected void populateFromResultSet(ThreadContext context, Ruby runtime, List results,
-            ResultSet resultSet, ColumnData[] columns) throws SQLException {
-        int columnCount = columns.length;
-
-        while (resultSet.next()) {
+    protected void populateFromResultSet(
+            final ThreadContext context, final Ruby runtime, 
+            final List<IRubyObject> results, final ResultSet resultSet, 
+            final ColumnData[] columns) throws SQLException {
+        final int columnCount = columns.length;
+        
+        while ( resultSet.next() ) {
             RubyHash row = RubyHash.newHash(runtime);
 
-            for (int i = 0; i < columnCount; i++) {
-                row.op_aset(context, columns[i].name, jdbcToRuby(runtime, columns[i].index, columns[i].type, resultSet));
+            for ( int i = 0; i < columnCount; i++ ) {
+                final ColumnData column = columns[i];
+                row.op_aset(context, column.name, jdbcToRuby(runtime, column.index, column.type, resultSet));
             }
 
             results.add(row);
         }
     }
-
-
-    protected IRubyObject readerToRuby(Ruby runtime, ResultSet resultSet, Reader reader)
-            throws SQLException, IOException {
-        if (reader == null && resultSet.wasNull()) return runtime.getNil();
-
-        StringBuffer str = new StringBuffer(2048);
+    
+    protected IRubyObject jdbcToRuby(final Ruby runtime, final int column, 
+        final int type, final ResultSet resultSet) throws SQLException {
         try {
-            char[] buf = new char[2048];
-
-            for (int n = reader.read(buf); n != -1; n = reader.read(buf)) {
-                str.append(buf, 0, n);
+            switch (type) {
+            case Types.BLOB:
+            case Types.BINARY:
+            case Types.VARBINARY:
+            case Types.LONGVARBINARY:
+                InputStream stream = resultSet.getBinaryStream(column);
+                try {
+                    return streamToRuby(runtime, resultSet, stream);
+                }
+                finally { if ( stream != null ) stream.close(); }
+            case Types.CLOB:
+            case Types.NCLOB: // JDBC 4.0
+                Reader reader = resultSet.getCharacterStream(column);
+                try {
+                    return readerToRuby(runtime, resultSet, reader);
+                }
+                finally { if ( reader != null ) reader.close(); }
+            case Types.LONGVARCHAR:
+            case Types.LONGNVARCHAR: // JDBC 4.0
+                if ( runtime.is1_9() ) {
+                    reader = resultSet.getCharacterStream(column);
+                    try {
+                        return readerToRuby(runtime, resultSet, reader);
+                    }
+                    finally { if ( reader != null ) reader.close(); }
+                }
+                else {
+                    stream = resultSet.getBinaryStream(column);
+                    try {
+                        return streamToRuby(runtime, resultSet, stream);
+                    }
+                    finally { if ( stream != null ) stream.close(); }
+                }
+            case Types.TINYINT:
+            case Types.SMALLINT:
+            case Types.INTEGER:
+                return integerToRuby(runtime, resultSet, resultSet.getLong(column));
+            case Types.REAL:
+            case Types.FLOAT:
+            case Types.DOUBLE:
+                return doubleToRuby(runtime, resultSet, resultSet.getDouble(column));
+            case Types.BIGINT:
+                return bigIntegerToRuby(runtime, resultSet, resultSet.getString(column));
+            case Types.NUMERIC:
+            case Types.DECIMAL:
+                return decimalToRuby(runtime, resultSet, resultSet.getString(column));
+            case Types.DATE:
+                return dateToRuby(runtime, resultSet, resultSet.getDate(column));
+            case Types.TIME:
+                return timeToRuby(runtime, resultSet, resultSet.getTime(column));
+            case Types.TIMESTAMP:
+                return timestampToRuby(runtime, resultSet, resultSet.getTimestamp(column));
+            case Types.BIT:
+            case Types.BOOLEAN:
+                return booleanToRuby(runtime, resultSet, resultSet.getBoolean(column));
+            case Types.SQLXML: // JDBC 4.0
+                final SQLXML xml = resultSet.getSQLXML(column);
+                try {
+                    return stringToRuby(runtime, resultSet, xml.getString());
+                }
+                finally { xml.free(); }
+            case Types.NULL:
+                return runtime.getNil();
+            // NOTE: (JDBC) exotic stuff just cause it's so easy with JRuby :)
+            case Types.JAVA_OBJECT:
+            case Types.OTHER:
+                return objectToRuby(runtime, resultSet, resultSet.getObject(column));
+            case Types.ARRAY: // we handle JDBC Array into (Ruby) []
+                final Array array = resultSet.getArray(column);
+                try {
+                    return arrayToRuby(runtime, resultSet, array);
+                }
+                finally { array.free(); }
+            // (default) String
+            case Types.CHAR:
+            case Types.VARCHAR:
+            case Types.NCHAR: // JDBC 4.0
+            case Types.NVARCHAR: // JDBC 4.0
+            default:
+                return stringToRuby(runtime, resultSet, resultSet.getString(column));
             }
-        } finally {
-            reader.close();
+            // NOTE: not mapped types :
+            //case Types.DISTINCT:
+            //case Types.STRUCT:
+            //case Types.REF:
+            //case Types.DATALINK:
         }
-
-        return RubyString.newUnicodeString(runtime, str.toString());
+        catch (IOException e) {
+            throw new SQLException(e.getMessage(), e);
+        }
     }
 
-    private IRubyObject setConnection(Connection c) {
-        close(getConnection()); // Close previously open connection if there is one
+    protected IRubyObject integerToRuby(
+        final Ruby runtime, final ResultSet resultSet, final long longValue)
+        throws SQLException {
+        if ( longValue == 0 && resultSet.wasNull() ) return runtime.getNil();
 
-        IRubyObject rubyconn = c != null ? wrappedConnection(c) : getRuntime().getNil();
-        setInstanceVariable("@connection", rubyconn);
-        dataWrapStruct(c);
+        return runtime.newFixnum(longValue);
+    }
+
+    protected IRubyObject doubleToRuby(Ruby runtime, ResultSet resultSet, double doubleValue)
+        throws SQLException {
+        if ( doubleValue == 0 && resultSet.wasNull() ) return runtime.getNil();
+        return runtime.newFloat(doubleValue);
+    }
+    
+    protected IRubyObject stringToRuby(
+        final Ruby runtime, final ResultSet resultSet, final String string)
+        throws SQLException {
+        if ( string == null && resultSet.wasNull() ) return runtime.getNil();
+
+        return RubyString.newUnicodeString(runtime, string);
+    }
+    
+    protected IRubyObject bigIntegerToRuby(
+        final Ruby runtime, final ResultSet resultSet, final String intValue) 
+        throws SQLException {
+        if ( intValue == null && resultSet.wasNull() ) return runtime.getNil();
+
+        return RubyBignum.bignorm(runtime, new BigInteger(intValue));
+    }
+    
+    protected IRubyObject decimalToRuby(
+        final Ruby runtime, final ResultSet resultSet, final String decValue) 
+        throws SQLException {
+        if ( decValue == null && resultSet.wasNull() ) return runtime.getNil();
+        // NOTE: JRuby 1.6 -> 1.7 API change : moved org.jruby.RubyBigDecimal
+        return runtime.getKernel().callMethod("BigDecimal", runtime.newString(decValue));
+    }
+    
+    private static boolean parseDateTime = false; // TODO
+    
+    protected IRubyObject dateToRuby( // TODO
+        final Ruby runtime, final ResultSet resultSet, final Date date)
+        throws SQLException {
+        if ( date == null && resultSet.wasNull() ) return runtime.getNil();
+        return RubyString.newUnicodeString(runtime, date.toString());
+    }
+
+    protected IRubyObject timeToRuby( // TODO
+        final Ruby runtime, final ResultSet resultSet, final Time time)
+        throws SQLException {
+        if ( time == null && resultSet.wasNull() ) return runtime.getNil();
+        return RubyString.newUnicodeString(runtime, time.toString());
+    }
+    
+    protected IRubyObject timestampToRuby(
+        final Ruby runtime, final ResultSet resultSet, final Timestamp timestamp)
+        throws SQLException {
+        if ( timestamp == null && resultSet.wasNull() ) return runtime.getNil();
+        
+        String format = timestamp.toString(); // yyyy-mm-dd hh:mm:ss.fffffffff
+        if (format.endsWith(" 00:00:00.0")) {
+            format = format.substring(0, format.length() - (" 00:00:00.0".length()));
+        }
+        if (format.endsWith(".0")) {
+            format = format.substring(0, format.length() - (".0".length()));
+        }
+        
+        return RubyString.newUnicodeString(runtime, format);
+    }
+    
+    protected IRubyObject booleanToRuby(
+        final Ruby runtime, final ResultSet resultSet, final boolean value)
+        throws SQLException {
+        if ( resultSet.wasNull() ) return runtime.getNil();
+        return runtime.newBoolean(value);
+    }
+    
+    protected static int streamBufferSize = 2048;
+    
+    protected IRubyObject streamToRuby(
+        final Ruby runtime, final ResultSet resultSet, final InputStream stream)
+        throws SQLException, IOException {
+        if ( stream == null && resultSet.wasNull() ) return runtime.getNil();
+
+        final int bufSize = streamBufferSize;
+        final ByteList string = new ByteList(bufSize);
+        
+        final byte[] buf = new byte[bufSize];
+        for (int len = stream.read(buf); len != -1; len = stream.read(buf)) {
+            string.append(buf, 0, len);
+        }
+
+        return runtime.newString(string);
+    }
+    
+    protected IRubyObject readerToRuby(
+        final Ruby runtime, final ResultSet resultSet, final Reader reader)
+        throws SQLException, IOException {
+        if ( reader == null && resultSet.wasNull() ) return runtime.getNil();
+
+        final int bufSize = streamBufferSize;
+        final StringBuilder string = new StringBuilder(bufSize);
+        
+        final char[] buf = new char[bufSize];
+        for (int len = reader.read(buf); len != -1; len = reader.read(buf)) {
+            string.append(buf, 0, len);
+        }
+        
+        return RubyString.newUnicodeString(runtime, string.toString());
+    }
+
+    private IRubyObject objectToRuby(
+        final Ruby runtime, final ResultSet resultSet, final Object object)
+        throws SQLException {
+        if ( object == null && resultSet.wasNull() ) return runtime.getNil();
+        
+        return JavaUtil.convertJavaToRuby(runtime, object);
+    }
+    
+    private IRubyObject arrayToRuby(
+        final Ruby runtime, final ResultSet resultSet, final Array array)
+        throws SQLException {
+        if ( array == null && resultSet.wasNull() ) return runtime.getNil();
+        
+        final RubyArray rubyArray = runtime.newArray();
+        
+        final ResultSet arrayResult = array.getResultSet(); // 1: index, 2: value
+        final int baseType = array.getBaseType();
+        while ( arrayResult.next() ) {
+            IRubyObject element = jdbcToRuby(runtime, 2, baseType, arrayResult);
+            rubyArray.append(element);
+        }
+        return rubyArray;
+    }
+    
+    protected final Connection getConnection() {
+        return getConnection(false);
+    }
+
+    protected Connection getConnection(boolean error) {
+        final Connection connection = (Connection) dataGetStruct();
+        if ( connection == null && error ) {
+            RubyClass err = getRuntime().getModule("ActiveRecord").getClass("ConnectionNotEstablished");
+            throw new RaiseException(getRuntime(), err, "no connection available", false);
+        }
+        return connection;
+    }
+    
+    private synchronized RubyJdbcConnection setConnection(final Connection connection) {
+        close( getConnection(false) ); // close previously open connection if there is one
+        
+        final IRubyObject rubyConnectionObject = 
+            connection != null ? convertJavaToRuby(connection) : getRuntime().getNil();
+        setInstanceVariable( "@connection", rubyConnectionObject );
+        dataWrapStruct(connection);
         return this;
     }
 
+    private boolean isConnectionBroken(final ThreadContext context, final Connection connection) {
+        Statement statement = null;
+        try {
+            final RubyString aliveSQL = getConfigValue(context, "connection_alive_sql").convertToString();
+            if ( isSelect(aliveSQL) ) { // expect a SELECT/CALL SQL statement
+                statement = connection.createStatement();
+                statement.execute( aliveSQL.toString() );
+                return false; // connection ain't broken
+            }
+            else { // alive_sql nil (or not a statement we can execute)
+                return ! connection.isClosed(); // if closed than broken
+            }
+        }
+        catch (Exception e) { // TODO log this
+            return true;
+        }
+        finally { close(statement); }
+    }
+    
     private final static DateFormat FORMAT = new SimpleDateFormat("%y-%M-%d %H:%m:%s");
 
-    private static void setValue(PreparedStatement ps, int index, ThreadContext context,
-            IRubyObject value, IRubyObject type) throws SQLException {
-        final int tp = getTypeValueFor(context.getRuntime(), type);
-        if(value.isNil()) {
-            ps.setNull(index, tp);
+    private static void setValue(final ThreadContext context,
+            final IRubyObject value, final IRubyObject type, 
+            final PreparedStatement statement, final int index) throws SQLException {
+        
+        final int jdbcType = jdbcTypeFor(context, type);
+        
+        if ( value.isNil() ) {
+            statement.setNull(index, jdbcType);
             return;
         }
 
-        switch(tp) {
+        switch (jdbcType) {
         case Types.VARCHAR:
         case Types.CLOB:
-            ps.setString(index, RubyString.objAsString(context, value).toString());
+            statement.setString(index, RubyString.objAsString(context, value).toString());
             break;
         case Types.INTEGER:
-            ps.setLong(index, RubyNumeric.fix2long(value));
+            statement.setLong(index, RubyNumeric.fix2long(value));
             break;
         case Types.FLOAT:
-            ps.setDouble(index, ((RubyNumeric)value).getDoubleValue());
+            statement.setDouble(index, ((RubyNumeric) value).getDoubleValue());
             break;
         case Types.TIMESTAMP:
         case Types.TIME:
         case Types.DATE:
-            if(!(value instanceof RubyTime)) {
+            if ( ! ( value instanceof RubyTime ) ) {
+                final String stringValue = RubyString.objAsString(context, value).toString();
                 try {
-                    Date dd = FORMAT.parse(RubyString.objAsString(context, value).toString());
-                    ps.setTimestamp(index, new java.sql.Timestamp(dd.getTime()), Calendar.getInstance());
-                } catch(Exception e) {
-                    ps.setString(index, RubyString.objAsString(context, value).toString());
+                    Timestamp timestamp = new Timestamp( FORMAT.parse( stringValue ).getTime() );
+                    statement.setTimestamp( index, timestamp, Calendar.getInstance() );
+                }
+                catch (Exception e) {
+                    statement.setString( index, stringValue );
                 }
             } else {
-                RubyTime rubyTime = (RubyTime) value;
-                java.util.Date date = rubyTime.getJavaDate();
-                long millis = date.getTime();
-                long micros = rubyTime.microseconds() - millis / 1000;
-                java.sql.Timestamp ts = new java.sql.Timestamp(millis);
-                java.util.Calendar cal = Calendar.getInstance();
-                cal.setTime(date);
-                ts.setNanos((int)(micros * 1000));
-                ps.setTimestamp(index, ts, cal);
+                final RubyTime timeValue = (RubyTime) value;
+                final java.util.Date dateValue = timeValue.getJavaDate();
+                
+                long millis = dateValue.getTime();
+                Timestamp timestamp = new Timestamp(millis);
+                Calendar calendar = Calendar.getInstance();
+                calendar.setTime(dateValue);
+                if ( jdbcType != Types.DATE ) {
+                    int micros = (int) timeValue.microseconds();
+                    timestamp.setNanos( micros * 1000 ); // time.nsec ~ time.usec * 1000
+                }
+                statement.setTimestamp( index, timestamp, calendar );
             }
             break;
         case Types.BOOLEAN:
-            ps.setBoolean(index, value.isTrue());
+            statement.setBoolean(index, value.isTrue());
             break;
-        default: throw new RuntimeException("type " + type + " not supported in _bind yet");
+        default: throw new RuntimeException("type " + jdbcType + " not supported in _bind (yet)");
         }
     }
 
-    private static void setValuesOnPS(PreparedStatement ps, ThreadContext context,
-            IRubyObject valuesArg, IRubyObject typesArg) throws SQLException {
-        RubyArray values = (RubyArray) valuesArg;
-        RubyArray types = (RubyArray) typesArg;
-
-        for(int i=0, j=values.getLength(); i<j; i++) {
-            setValue(ps, i+1, context, values.eltInternal(i), types.eltInternal(i));
+    private static void setValues(final ThreadContext context,
+            final IRubyObject valuesArg, final IRubyObject typesArg,
+            final PreparedStatement statement) throws SQLException {
+        final RubyArray values = (RubyArray) valuesArg;
+        final RubyArray types = (RubyArray) typesArg;
+        for( int i = 0, j = values.getLength(); i < j; i++ ) {
+            setValue(context, values.eltInternal(i), types.eltInternal(i), statement, i + 1);
         }
     }
-
-    protected IRubyObject streamToRuby(Ruby runtime, ResultSet resultSet, InputStream is)
-            throws SQLException, IOException {
-        if (is == null && resultSet.wasNull()) return runtime.getNil();
-
-        ByteList str = new ByteList(2048);
+    
+    private boolean tableExists(final Ruby runtime, 
+        final Connection connection, final TableName tableName) throws SQLException {
+        final IRubyObject matchedTables = 
+            matchTables(runtime, connection, tableName.catalog, tableName.schema, tableName.name, getTableTypes(), true);
+        // NOTE: allow implementers to ignore checkExistsOnly paramater - empty array means does not exists
+        return matchedTables != null && ! matchedTables.isNil() &&
+            ( ! (matchedTables instanceof RubyArray) || ! ((RubyArray) matchedTables).isEmpty() );
+    }
+    
+    /**
+     * Match table names for given table name (pattern).
+     * @param runtime
+     * @param connection
+     * @param catalog
+     * @param schemaPattern
+     * @param tablePattern
+     * @param types table types
+     * @param checkExistsOnly an optimization flag (that might be ignored by sub-classes) 
+     * whether the result really matters if true no need to map table names and a truth-y 
+     * value is sufficient (except for an empty array which is considered that the table
+     * did not exists).
+     * @return matched (and Ruby mapped) table names
+     * @see #mapTables(Ruby, DatabaseMetaData, String, String, String, ResultSet) 
+     * @throws SQLException 
+     */
+    protected IRubyObject matchTables(final Ruby runtime, 
+            final Connection connection,
+            final String catalog, final String schemaPattern,
+            final String tablePattern, final String[] types,
+            final boolean checkExistsOnly) throws SQLException {
+        
+        final DatabaseMetaData metaData = connection.getMetaData();
+        
+        final String _tablePattern = caseConvertIdentifierForJdbc(metaData, tablePattern);
+        final String _schemaPattern = caseConvertIdentifierForJdbc(metaData, schemaPattern);
+        
+        ResultSet tablesSet = null;
         try {
-            byte[] buf = new byte[2048];
-
-            for (int n = is.read(buf); n != -1; n = is.read(buf)) {
-                str.append(buf, 0, n);
+            tablesSet = metaData.getTables(catalog, _schemaPattern, _tablePattern, types);
+            if ( checkExistsOnly ) { // only check if given table exists
+                return tablesSet.next() ? runtime.getTrue() : null;
             }
-        } finally {
-            is.close();
+            else {
+                return mapTables(runtime, metaData, catalog, _schemaPattern, _tablePattern, tablesSet);
+            }
         }
-
-        return runtime.newString(str);
+        finally { close(tablesSet); }
+    }
+    
+    // NOTE java.sql.DatabaseMetaData.getTables :
+    protected final static int TABLES_TABLE_CAT = 1;
+    protected final static int TABLES_TABLE_SCHEM = 2;
+    protected final static int TABLES_TABLE_NAME = 3;
+    protected final static int TABLES_TABLE_TYPE = 4;
+    
+    /**
+     * @param runtime
+     * @param metaData
+     * @param catalog
+     * @param schemaPattern
+     * @param tablePattern
+     * @param tablesSet
+     * @return List<RubyString>
+     * @throws SQLException 
+     */
+    protected RubyArray mapTables(final Ruby runtime, final DatabaseMetaData metaData, 
+            final String catalog, final String schemaPattern, final String tablePattern, 
+            final ResultSet tablesSet) throws SQLException {
+        final RubyArray tables = runtime.newArray();
+        while ( tablesSet.next() ) {
+            String name = tablesSet.getString(TABLES_TABLE_NAME);
+            name = caseConvertIdentifierForRails(metaData, name);
+            tables.add(RubyString.newUnicodeString(runtime, name));
+        }
+        return tables;
     }
 
-    protected IRubyObject stringToRuby(Ruby runtime, ResultSet resultSet, String string)
-            throws SQLException, IOException {
-        if (string == null && resultSet.wasNull()) return runtime.getNil();
-
-        return RubyString.newUnicodeString(runtime, string);
-    }
-
-
+    /**
+     * NOTE: since 1.3.0 only present for binary compatibility (with extensions).
+     * 
+     * @depreacated no longer used - replaced with 
+     * {@link #matchTables(Ruby, Connection, String, String, String, String[], boolean)}
+     * please update your sub-class esp. if you're overriding this method !
+     */
+    @Deprecated
     protected SQLBlock tableLookupBlock(final Ruby runtime,
-            final String catalog, final String schemapat,
-            final String tablepat, final String[] types, final boolean downCase) {
-        final int TABLE_SCHEM = 2;
-        final int TABLE_NAME = 3;
-        final int TABLE_TYPE = 4;
+            final String catalog, final String schemaPattern,
+            final String tablePattern, final String[] types) {
         return new SQLBlock() {
-            public Object call(Connection c) throws SQLException {
-                ResultSet rs = null;
-                try {
-                    DatabaseMetaData metadata = c.getMetaData();
-                    String clzName = metadata.getClass().getName().toLowerCase();
-                    boolean isOracle = clzName.indexOf("oracle") != -1 || clzName.indexOf("oci") != -1;
-                    boolean isDerby = clzName.indexOf("derby") != -1;
-                    boolean isMssql = clzName.indexOf("sqlserver") != -1 || clzName.indexOf("tds") != -1;
-
-                    String realschema = schemapat;
-                    String realtablepat = tablepat;
-
-                    if (isDerby && realschema != null && realschema.equals("")) realschema = null;  // Derby doesn't like empty-string schema name
-                    if (realtablepat != null) realtablepat = caseConvertIdentifierForJdbc(metadata, realtablepat);
-                    if (realschema != null) realschema = caseConvertIdentifierForJdbc(metadata, realschema);
-
-                    rs = metadata.getTables(catalog, realschema, realtablepat, types);
-                    List arr = new ArrayList();
-                    while (rs.next()) {
-                        String name;
-                        String schema = rs.getString(TABLE_SCHEM) != null ? rs.getString(TABLE_SCHEM).toLowerCase() : null;
-
-                        if (downCase) {
-                            name = rs.getString(TABLE_NAME).toLowerCase();
-                        } else {
-                            name = caseConvertIdentifierForRails(metadata, rs.getString(TABLE_NAME));
-                        }
-                        // Handle stupid Oracle 10g RecycleBin feature
-                        if (isOracle && name.startsWith("bin$")) {
-                            continue;
-                        }
-                        // Under mssql, don't return system tables/views unless they're explicitly asked for.
-                        if (isMssql && realschema==null &&
-                            ("sys".equals(schema) || "information_schema".equals(schema))) {
-                            continue;
-                        }
-                        arr.add(RubyString.newUnicodeString(runtime, name));
-                    }
-                    return runtime.newArray(arr);
-                } finally {
-                    close(rs);
-                }
+            public IRubyObject call(final Connection connection) throws SQLException {
+                return matchTables(runtime, connection, catalog, schemaPattern, tablePattern, types, false);
             }
         };
     }
-
-    protected IRubyObject timestampToRuby(Ruby runtime, ResultSet resultSet, Timestamp time)
-            throws SQLException {
-        if (time == null && resultSet.wasNull()) return runtime.getNil();
-
-        String str = time.toString();
-        if (str.endsWith(" 00:00:00.0")) {
-            str = str.substring(0, str.length() - (" 00:00:00.0".length()));
-        }
-        if (str.endsWith(".0")) {
-            str = str.substring(0, str.length() - (".0".length()));
-        }
-
-        return RubyString.newUnicodeString(runtime, str);
-    }
-
+    
     protected static final int COLUMN_NAME = 4;
     protected static final int DATA_TYPE = 5;
     protected static final int TYPE_NAME = 6;
@@ -1061,18 +1375,21 @@ public class RubyJdbcConnection extends RubyObject {
      * Create a string which represents a sql type usable by Rails from the resultSet column
      * metadata object.
      */
-    protected String typeFromResultSet(ResultSet resultSet) throws SQLException {
-        int precision = intFromResultSet(resultSet, COLUMN_SIZE);
-        int scale = intFromResultSet(resultSet, DECIMAL_DIGITS);
+    protected String typeFromResultSet(final ResultSet resultSet) throws SQLException {
+        final int precision = intFromResultSet(resultSet, COLUMN_SIZE);
+        final int scale = intFromResultSet(resultSet, DECIMAL_DIGITS);
 
-        String type = resultSet.getString(TYPE_NAME);
-        if (precision > 0) {
-            type += "(" + precision;
-            if(scale > 0) type += "," + scale;
-            type += ")";
-        }
+        final String type = resultSet.getString(TYPE_NAME);
+        return formatTypeWithPrecisionAndScale(type, precision, scale);
+    }
 
-        return type;
+    protected static String formatTypeWithPrecisionAndScale(final String type, final int precision, final int scale) {
+        if ( precision <= 0 ) return type;
+
+        final StringBuilder typeStr = new StringBuilder().append(type);
+        typeStr.append('(').append(precision); // type += "(" + precision;
+        if ( scale > 0 ) typeStr.append(',').append(scale); // type += "," + scale;
+        return typeStr.append(')').toString(); // type += ")";
     }
 
     private IRubyObject defaultValueFromResultSet(Ruby runtime, ResultSet resultSet)
@@ -1082,151 +1399,241 @@ public class RubyJdbcConnection extends RubyObject {
         return defaultValue == null ? runtime.getNil() : RubyString.newUnicodeString(runtime, defaultValue);
     }
 
-    private IRubyObject unmarshal_columns(ThreadContext context, DatabaseMetaData metadata,
-                                          ResultSet rs, ResultSet pkeys) throws SQLException {
-        try {
-            Ruby runtime = context.getRuntime();
-            List columns = new ArrayList();
-            List pkeyNames = new ArrayList();
-            String clzName = metadata.getClass().getName().toLowerCase();
+    private IRubyObject unmarshalColumns(final ThreadContext context, final DatabaseMetaData metaData, 
+        final ResultSet results, final ResultSet primaryKeys) throws SQLException {
+        
+        final Ruby runtime = context.getRuntime();
+        // RubyHash types = (RubyHash) native_database_types();
+        final IRubyObject jdbcColumn = getJdbcColumnClass(context);
 
-            RubyHash types = (RubyHash) native_database_types();
-            IRubyObject jdbcCol = getJdbcColumnClass(context);
-
-            while (pkeys.next()) {
-                pkeyNames.add(pkeys.getString(COLUMN_NAME));
-            }
-
-            while (rs.next()) {
-                String colName = rs.getString(COLUMN_NAME);
-                IRubyObject column = jdbcCol.callMethod(context, "new",
-                        new IRubyObject[] {
-                            getInstanceVariable("@config"),
-                            RubyString.newUnicodeString(runtime,
-                                    caseConvertIdentifierForRails(metadata, colName)),
-                            defaultValueFromResultSet(runtime, rs),
-                            RubyString.newUnicodeString(runtime, typeFromResultSet(rs)),
-                            runtime.newBoolean(!rs.getString(IS_NULLABLE).trim().equals("NO"))
-                        });
-                columns.add(column);
-
-                if (pkeyNames.contains(colName)) {
-                    column.callMethod(context, "primary=", runtime.getTrue());
-                }
-            }
-            return runtime.newArray(columns);
-        } finally {
-            close(rs);
+        final List<String> primarykeyNames = new ArrayList<String>();
+        while ( primaryKeys.next() ) {
+            primarykeyNames.add( primaryKeys.getString(COLUMN_NAME) );
         }
+
+        final List<IRubyObject> columns = new ArrayList<IRubyObject>();
+        while ( results.next() ) {
+            final String colName = results.getString(COLUMN_NAME);
+            IRubyObject column = jdbcColumn.callMethod(context, "new",
+                new IRubyObject[] {
+                    getInstanceVariable("@config"),
+                    RubyString.newUnicodeString( runtime, caseConvertIdentifierForRails(metaData, colName) ),
+                    defaultValueFromResultSet( runtime, results ),
+                    RubyString.newUnicodeString( runtime, typeFromResultSet(results) ),
+                    runtime.newBoolean( ! results.getString(IS_NULLABLE).trim().equals("NO") )
+                });
+            columns.add(column);
+
+            if ( primarykeyNames.contains(colName) ) {
+                column.callMethod(context, "primary=", runtime.getTrue());
+            }
+        }
+        return runtime.newArray(columns);
     }
 
-
-    public static IRubyObject unmarshal_id_result(Ruby runtime, ResultSet rs) throws SQLException {
+    protected static IRubyObject unmarshalIdResult(
+        final Ruby runtime, final Statement statement) throws SQLException {
+        final ResultSet genKeys = statement.getGeneratedKeys();
         try {
-            if (rs.next() && rs.getMetaData().getColumnCount() > 0) {
-                return runtime.newFixnum(rs.getLong(1));
+            if (genKeys.next() && genKeys.getMetaData().getColumnCount() > 0) {
+                return runtime.newFixnum( genKeys.getLong(1) );
             }
             return runtime.getNil();
-        } finally {
-            close(rs);
         }
+        finally { close(genKeys); }
     }
-
-    protected IRubyObject unmarshalResults(ThreadContext context, DatabaseMetaData metadata,
-                                           Statement stmt, boolean downCase) throws SQLException {
-        Ruby runtime = context.getRuntime();
-        List<IRubyObject> sets = new ArrayList<IRubyObject>();
-
-        while (true) {
-            sets.add(unmarshalResult(context, metadata, stmt.getResultSet(), downCase));
-            if (!stmt.getMoreResults()) {
-                break;
+    
+    /**
+     * @deprecated confusing as it closes the result set it receives use 
+     * @see #unmarshalIdResult(Ruby, Statement)
+     */
+    @Deprecated
+    public static IRubyObject unmarshal_id_result(
+        final Ruby runtime, final ResultSet genKeys) throws SQLException {
+        try {
+            if (genKeys.next() && genKeys.getMetaData().getColumnCount() > 0) {
+                return runtime.newFixnum( genKeys.getLong(1) );
             }
+            return runtime.getNil();
         }
+        finally { close(genKeys); }
+     }
 
-        if (sets.size() > 1) {
-            return runtime.newArray(sets);
-        } else {
-            return sets.get(0);
+    protected IRubyObject unmarshalResults(final ThreadContext context, 
+            final DatabaseMetaData metaData, final Statement statement, 
+            final boolean downCase) throws SQLException {
+        
+        final Ruby runtime = context.getRuntime();
+        IRubyObject result = unmarshalResult(context, runtime, metaData, statement.getResultSet(), downCase);
+        
+        if ( ! statement.getMoreResults() ) return result;
+        
+        final List<IRubyObject> results = new ArrayList<IRubyObject>();
+        results.add(result);
+        do {
+            result = unmarshalResult(context, runtime, metaData, statement.getResultSet(), downCase);
+            results.add(result);
         }
+        while ( statement.getMoreResults() );
+
+        return context.getRuntime().newArray(results);
     }
 
+     /**
+     * @deprecated no longer used but kept for API compatibility
+     */
+    @Deprecated
+    protected IRubyObject unmarshalResult(final ThreadContext context,
+            final DatabaseMetaData metaData, final ResultSet resultSet, 
+            final boolean downCase) throws SQLException {
+        return unmarshalResult(context, context.getRuntime(), metaData, resultSet, downCase);
+    }
+    
     /**
      * Converts a jdbc resultset into an array (rows) of hashes (row) that AR expects.
      *
      * @param downCase should column names only be in lower case?
      */
-    protected IRubyObject unmarshalResult(ThreadContext context, DatabaseMetaData metadata,
-                                          ResultSet resultSet, boolean downCase) throws SQLException {
-        Ruby runtime = context.getRuntime();
-        List results = new ArrayList();
-
+    private IRubyObject unmarshalResult(final ThreadContext context, final Ruby runtime,
+            final DatabaseMetaData metaData, final ResultSet resultSet, 
+            final boolean downCase) throws SQLException {
+        
+        final List<IRubyObject> results = new ArrayList<IRubyObject>();
         try {
-            ColumnData[] columns = ColumnData.setup(runtime, metadata, resultSet.getMetaData(), downCase);
+            ColumnData[] columns = setupColumns(runtime, metaData, resultSet.getMetaData(), downCase);
 
             populateFromResultSet(context, runtime, results, resultSet, columns);
-        } finally {
-            close(resultSet);
         }
+        finally { close(resultSet); }
 
         return runtime.newArray(results);
     }
-
-    protected Object withConnectionAndRetry(ThreadContext context, SQLBlock block) {
-        int tries = 1;
-        int i = 0;
-        Throwable toWrap = null;
-        boolean autoCommit = false;
-        while (i < tries) {
-            Connection c = getConnection(true);
+    
+    /**
+     * @deprecated renamed and parameterized to {@link #withConnection(ThreadContext, SQLBlock)}
+     */
+    @Deprecated
+    @SuppressWarnings("unchecked")
+    protected Object withConnectionAndRetry(final ThreadContext context, final SQLBlock block) 
+        throws RaiseException {
+        return withConnection(context, block);
+    }
+    
+    protected <T> T withConnection(final ThreadContext context, final Callable<T> block) 
+        throws RaiseException {
+        try {
+            return withConnection(context, true, block);
+        }
+        catch (final SQLException e) {
+            return handleException(context, e); // should never happen
+        }
+    }
+    
+    private <T> T withConnection(final ThreadContext context, final boolean handleException, final Callable<T> block) 
+        throws RaiseException, RuntimeException, SQLException {
+        
+        Throwable exception = null; int tries = 1; int i = 0;
+        
+        while ( i++ < tries ) {
+            final Connection connection = getConnection(true);
+            boolean autoCommit = true; // retry in-case getAutoCommit throws
             try {
-                autoCommit = c.getAutoCommit();
-                return block.call(c);
-            } catch (Exception e) {
-                toWrap = e;
-                while (toWrap.getCause() != null && toWrap.getCause() != toWrap) {
-                    toWrap = toWrap.getCause();
-                }
+                autoCommit = connection.getAutoCommit();
+                return block.call(connection);
+            }
+            catch (final Exception e) { // SQLException or RuntimeException
+                exception = e;
 
-                if (context.getRuntime().isDebug()) {
-                    toWrap.printStackTrace(System.out);
-                }
-
-                i++;
-                if (autoCommit) {
-                    if (i == 1) {
-                        tries = (int) rubyApi.convertToRubyInteger(config_value(context, "retry_count")).getLongValue();
-                        if (tries <= 0) {
-                            tries = 1;
-                        }
+                if ( autoCommit ) { // do not retry if (inside) transactions
+                    if ( i == 1 ) {
+                        IRubyObject retryCount = getConfigValue(context, "retry_count");
+                        tries = (int) retryCount.convertToInteger().getLongValue();
+                        if ( tries <= 0 ) tries = 1;
                     }
-                    if (isConnectionBroken(context, c)) {
-                        reconnect();
-                    } else {
-                        throw wrap(context, toWrap);
+                    if ( isConnectionBroken(context, connection) ) {
+                        reconnect(context); continue; // retry connection (block) again
                     }
+                    break; // connection not broken yet failed
                 }
             }
         }
-        throw wrap(context, toWrap);
-    }
-
-    protected RuntimeException wrap(ThreadContext context, Throwable exception) {
-        Ruby runtime = context.getRuntime();
-        RaiseException arError = new RaiseException(runtime, runtime.getModule("ActiveRecord").getClass("JDBCError"),
-                                                    exception.getMessage(), true);
-        arError.initCause(exception);
-        if (exception instanceof SQLException) {
-            RuntimeHelpers.invoke(context, arError.getException(),
-                                  "errno=", runtime.newFixnum(((SQLException) exception).getErrorCode()));
-            RuntimeHelpers.invoke(context, arError.getException(),
-                                  "sql_exception=", JavaEmbedUtils.javaToRuby(runtime, exception));
+        // (retry) loop ended and we did not return ... exception != null
+        if ( handleException ) {
+            return handleException(context, getCause(exception)); // throws
         }
-        return (RuntimeException) arError;
+        else {
+            if ( exception instanceof SQLException ) {
+                throw (SQLException) exception;
+            }
+            if ( exception instanceof RuntimeException ) {
+                throw (RuntimeException) exception;
+            }
+            // won't happen - our try block only throws SQL or Runtime exceptions
+            throw new RuntimeException(exception);
+        }
     }
 
-    private IRubyObject wrappedConnection(Connection c) {
-        return Java.java_to_ruby(this, JavaObject.wrap(getRuntime(), c), Block.NULL_BLOCK);
+    private static Throwable getCause(Throwable exception) {
+        Throwable cause = exception.getCause();
+        while (cause != null && cause != exception) {
+            // SQLException's cause might be DB specific (checked/unchecked) :
+            if ( exception instanceof SQLException ) break;
+            exception = cause; cause = exception.getCause();
+        }
+        return exception;
+    }
+
+    protected <T> T handleException(final ThreadContext context, Throwable exception) 
+        throws RaiseException {
+        // NOTE: we shall not wrap unchecked (runtime) exceptions into AR::Error
+        // if it's really a misbehavior of the driver throwing a RuntimeExcepion
+        // instead of SQLException than this should be overriden for the adapter
+        if ( exception instanceof RuntimeException ) {
+            throw (RuntimeException) exception;
+        }
+        debugStackTrace(context, exception);
+        throw wrapException(context, exception);
+    }
+    
+    /**
+     * @deprecated use {@link #wrapException(ThreadContext, Throwable)} instead
+     * for overriding how exceptions are handled use {@link #handleException(ThreadContext, Throwable)}
+     */
+    @Deprecated
+    protected RuntimeException wrap(final ThreadContext context, final Throwable exception) {
+        return wrapException(context, exception);
+    }
+    
+    protected RaiseException wrapException(final ThreadContext context, final Throwable exception) {
+        final Ruby runtime = context.getRuntime();
+        if ( exception instanceof SQLException ) {
+            final String message = SQLException.class == exception.getClass() ? 
+                exception.getMessage() : exception.toString(); // useful to easily see type on Ruby side
+            final RaiseException error = wrapException(context, getJDBCError(runtime), exception, message);
+            final int errorCode = ((SQLException) exception).getErrorCode();
+            RuntimeHelpers.invoke( context, error.getException(),
+                "errno=", runtime.newFixnum(errorCode) );
+            RuntimeHelpers.invoke( context, error.getException(),
+                "sql_exception=", JavaEmbedUtils.javaToRuby(runtime, exception) );
+            return error;
+        }
+        return wrapException(context, getJDBCError(runtime), exception);
+    }
+
+    protected static RaiseException wrapException(final ThreadContext context, 
+        final RubyClass errorClass, final Throwable exception) {
+        return wrapException(context, errorClass, exception, exception.toString());
+    }
+
+    protected static RaiseException wrapException(final ThreadContext context, 
+        final RubyClass errorClass, final Throwable exception, final String message) {
+        final RaiseException error = new RaiseException(context.getRuntime(), errorClass, message, true);
+        error.initCause(exception);
+        return error;
+    }
+    
+    private IRubyObject convertJavaToRuby(final Connection connection) {
+        return JavaUtil.convertJavaToRuby( getRuntime(), connection );
     }
 
     /**
@@ -1237,109 +1644,212 @@ public class RubyJdbcConnection extends RubyObject {
         return false;
     }
 
-    private static int whitespace(int start, ByteList bl) {
-        int end = bl.begin + bl.realSize;
-
-        for (int i = start; i < end; i++) {
-            if (!Character.isWhitespace(bl.bytes[i])) return i;
-        }
-
-        return end;
+    private static final byte[] SELECT = new byte[] { 's','e','l','e','c','t' };
+    private static final byte[] WITH = new byte[] { 'w','i','t','h' };
+    private static final byte[] SHOW = new byte[] { 's','h','o','w' };
+    private static final byte[] CALL = new byte[]{ 'c','a','l','l' };
+    
+    @JRubyMethod(name = "select?", required = 1, meta = true, frame = false)
+    public static IRubyObject select_p(final ThreadContext context, 
+        final IRubyObject self, final IRubyObject sql) {
+        return context.getRuntime().newBoolean( isSelect(sql.convertToString()) );
     }
 
-    private static byte[] CALL = new byte[]{'c', 'a', 'l', 'l'};
-    private static byte[] INSERT = new byte[] {'i', 'n', 's', 'e', 'r', 't'};
-    private static byte[] SELECT = new byte[] {'s', 'e', 'l', 'e', 'c', 't'};
-    private static byte[] SHOW = new byte[] {'s', 'h', 'o', 'w'};
+    private static boolean isSelect(final RubyString sql) {
+        final ByteList sqlBytes = sql.getByteList();
+        return startsWithIgnoreCase(sqlBytes, SELECT) || 
+               startsWithIgnoreCase(sqlBytes, WITH) ||
+               startsWithIgnoreCase(sqlBytes, SHOW) || 
+               startsWithIgnoreCase(sqlBytes, CALL);
+    }
+    
+    private static final byte[] INSERT = new byte[] { 'i','n','s','e','r','t' };
+    
+    @JRubyMethod(name = "insert?", required = 1, meta = true, frame = false)
+    public static IRubyObject insert_p(final ThreadContext context, 
+        final IRubyObject self, final IRubyObject sql) {
+        final ByteList sqlBytes = sql.convertToString().getByteList();
+        return context.getRuntime().newBoolean(startsWithIgnoreCase(sqlBytes, INSERT));
+    }
 
-    private static boolean startsWithNoCaseCmp(ByteList bytelist, byte[] compare) {
-        int p = whitespace(bytelist.begin, bytelist);
+    protected static boolean startsWithIgnoreCase(final ByteList string, final byte[] start) {
+        int p = skipWhitespace(string, string.getBegin());
+        final byte[] stringBytes = string.unsafeBytes();
+        if ( stringBytes[p] == '(' ) p = skipWhitespace(string, p + 1);
 
-        // What the hell is this for?
-        if (bytelist.bytes[p] == '(') p = whitespace(p, bytelist);
-
-        for (int i = 0; i < bytelist.realSize && i < compare.length; i++) {
-            if (Character.toLowerCase(bytelist.bytes[p + i]) != compare[i]) return false;
+        for ( int i = 0; i < string.getRealSize() && i < start.length; i++ ) {
+            if ( Character.toLowerCase(stringBytes[p + i]) != start[i] ) return false;
         }
-
         return true;
     }
 
-    private TableNameComponents extractTableNameComponents(Connection connection, String defaultSchema, String tableName) throws SQLException {
-        String schemaName = null;
+    private static int skipWhitespace(final ByteList string, final int from) {
+        final int end = string.getBegin() + string.getRealSize();
+        final byte[] stringBytes = string.unsafeBytes();
+        for ( int i = from; i < end; i++ ) {
+            if ( ! Character.isWhitespace( stringBytes[i] ) ) return i;
+        }
+        return end;
+    }
+    
+    protected static final class TableName {
+        
+        public final String catalog, schema, name;
 
-        final String[] name_parts = tableName.split("\\.");
-        if (name_parts.length > 3) {
-            throw new SQLException("Table name '" + tableName + "' should not contain more than 2 '.'");
+        public TableName(String catalog, String schema, String table) {
+            this.catalog = catalog;
+            this.schema = schema;
+            this.name = table;
+        }
+        
+    }
+    
+    /**
+     * Extract the table name components for the given name e.g. "mycat.sys.entries"
+     * 
+     * @param connection
+     * @param catalog (optional) catalog to use if table name does not contain 
+     *                 the catalog prefix
+     * @param schema (optional) schema to use if table name does not have one
+     * @param tableName the table name
+     * @return (parsed) table name
+     * 
+     * @throws IllegalArgumentException for invalid table name format
+     * @throws SQLException 
+     */
+    protected TableName extractTableName(
+            final Connection connection, String catalog, String schema, 
+            final String tableName) throws IllegalArgumentException, SQLException {
+
+        final String[] nameParts = tableName.split("\\.");
+        if ( nameParts.length > 3 ) {
+            throw new IllegalArgumentException("table name: " + tableName + " should not contain more than 2 '.'");
         }
 
-        DatabaseMetaData metadata = connection.getMetaData();
-        String clzName = metadata.getClass().getName().toLowerCase();
-        boolean isPostgres = clzName.contains("postgresql");
-
-        String catalog = connection.getCatalog();
-        if (name_parts.length == 2) {
-            schemaName = name_parts[0];
-            tableName = name_parts[1];
-        } else if (name_parts.length == 3) {
-            catalog = name_parts[0];
-            schemaName = name_parts[1];
-            tableName = name_parts[2];
+        String name = tableName;
+        
+        if ( nameParts.length == 2 ) {
+            schema = nameParts[0];
+            name = nameParts[1];
         }
+        else if ( nameParts.length == 3 ) {
+            catalog = nameParts[0];
+            schema = nameParts[1];
+            name = nameParts[2];
+        }
+        
+        final DatabaseMetaData metaData = connection.getMetaData();
+        
+        if (schema != null) {
+            schema = caseConvertIdentifierForJdbc(metaData, schema);
+        }
+        name = caseConvertIdentifierForJdbc(metaData, name);
 
-        if (schemaName == null && defaultSchema != null) schemaName = defaultSchema;
+        if (schema != null && ! databaseSupportsSchemas()) {
+            catalog = schema;
+        }
+        if (catalog == null) catalog = connection.getCatalog();
 
-        // The postgres JDBC driver will default to searching every schema if no
-        // schema search path is given.  Default to the public schema instead.
-        if (schemaName == null && isPostgres) schemaName = "public";
-        if (schemaName != null) schemaName = caseConvertIdentifierForJdbc(metadata, schemaName);
-        tableName = caseConvertIdentifierForJdbc(metadata, tableName);
-
-        if (schemaName != null && !databaseSupportsSchemas()) { catalog = schemaName; }
-
-        return new TableNameComponents(catalog, schemaName, tableName);
+        return new TableName(catalog, schema, name);
+    }
+    
+    /**
+     * @deprecated use {@link #extractTableName(Connection, String, String, String)}
+     */
+    @Deprecated
+    protected TableName extractTableName(
+            final Connection connection, final String schema, 
+            final String tableName) throws IllegalArgumentException, SQLException {
+        return extractTableName(connection, null, schema, tableName);
     }
 
-    public static class ColumnData {
-        public IRubyObject name;
-        public int index;
-        public int type;
+    protected static final class ColumnData {
+        
+        public final RubyString name;
+        public final int index;
+        public final int type;
 
-        public ColumnData(IRubyObject name, int type, int idx) {
+        public ColumnData(RubyString name, int type, int idx) {
             this.name = name;
             this.type = type;
             this.index = idx;
         }
+        
+    }
+    
+    private static ColumnData[] setupColumns(
+            final Ruby runtime, 
+            final DatabaseMetaData metaData,
+            final ResultSetMetaData resultMetaData, 
+            final boolean downCase) throws SQLException {
 
-        public static ColumnData[] setup(Ruby runtime, DatabaseMetaData databaseMetadata,
-                ResultSetMetaData metadata, boolean downCase) throws SQLException {
-            int columnsCount = metadata.getColumnCount();
-            ColumnData[] columns = new ColumnData[columnsCount];
+        final int columnCount = resultMetaData.getColumnCount();
+        final ColumnData[] columns = new ColumnData[columnCount];
 
-            for (int i = 1; i <= columnsCount; i++) { // metadata is one-based
-                String name;
-                if (downCase) {
-                    name = metadata.getColumnLabel(i).toLowerCase();
-                } else {
-                    name = RubyJdbcConnection.caseConvertIdentifierForRails(databaseMetadata, metadata.getColumnLabel(i));
-                }
-
-                columns[i - 1] = new ColumnData(RubyString.newUnicodeString(runtime, name), metadata.getColumnType(i), i);
+        for ( int i = 1; i <= columnCount; i++ ) { // metadata is one-based
+            final String name;
+            if (downCase) {
+                name = resultMetaData.getColumnLabel(i).toLowerCase();
+            } else {
+                name = caseConvertIdentifierForRails(metaData, resultMetaData.getColumnLabel(i));
             }
+            final int columnType = resultMetaData.getColumnType(i);
+            final RubyString columnName = RubyString.newUnicodeString(runtime, name);
+            columns[i - 1] = new ColumnData(columnName, columnType, i);
+        }
 
-            return columns;
+        return columns;
+    }
+    
+    // JDBC API Helpers :
+    
+    protected static void close(final Connection connection) {
+        if ( connection != null ) {
+            try { connection.close(); }
+            catch (final Exception e) { /* NOOP */ }
         }
     }
 
-    private static class TableNameComponents {
-        private String catalog;
-        private String schema;
-        private String table;
-
-        private TableNameComponents(String catalog, String schema, String table) {
-            this.catalog = catalog;
-            this.schema = schema;
-            this.table = table;
+    public static void close(final ResultSet resultSet) {
+        if (resultSet != null) {
+            try { resultSet.close(); }
+            catch (final Exception e) { /* NOOP */ }
         }
     }
+
+    public static void close(final Statement statement) {
+        if (statement != null) {
+            try { statement.close(); }
+            catch (final Exception e) { /* NOOP */ }
+        }
+    }
+    
+    // DEBUG-ing helpers :
+    
+    private static boolean debug = Boolean.getBoolean("arjdbc.debug");
+
+    public static boolean isDebug() { return debug; }
+    
+    public static void setDebug(boolean debug) {
+        RubyJdbcConnection.debug = debug;
+    }
+    
+    public static void debugMessage(final ThreadContext context, final String msg) {
+        if ( debug || context.runtime.isDebug() ) {
+            context.runtime.getOut().println(msg);
+        }
+    }
+    
+    protected static void debugErrorSQL(final ThreadContext context, final String sql) {
+        if ( debug || context.runtime.isDebug() ) {
+            context.runtime.getOut().println("Error SQL: " + sql);
+        }
+    }
+    
+    public static void debugStackTrace(final ThreadContext context, final Throwable e) {
+        if ( debug || context.runtime.isDebug() ) {
+            e.printStackTrace(context.runtime.getOut());
+        }
+    }
+    
 }

@@ -1,13 +1,6 @@
-POSTGRES_CONFIG = {
-  :adapter => 'postgresql',
-  :database => 'arjdbc_test',
-  :host => 'localhost',
-  :username => 'arjdbc',
-  :password => 'arjdbc'
-}
+require 'test_helper'
+require 'db/postgres_config'
 
-POSTGRES_CONFIG[:host] = ENV['PGHOST'] if ENV['PGHOST']
-POSTGRES_CONFIG[:port] = ENV['PGPORT'] if ENV['PGPORT']
 ActiveRecord::Base.establish_connection(POSTGRES_CONFIG)
 
 begin

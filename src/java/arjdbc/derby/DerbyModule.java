@@ -26,27 +26,32 @@ package arjdbc.derby;
 
 import java.sql.SQLException;
 
+import static arjdbc.util.QuotingUtils.BYTES_0;
+import static arjdbc.util.QuotingUtils.BYTES_1;
+
 import arjdbc.jdbc.RubyJdbcConnection;
 
 import org.jruby.Ruby;
 import org.jruby.RubyBoolean;
 import org.jruby.RubyModule;
 import org.jruby.RubyObjectAdapter;
-import org.jruby.RubyRange;
 import org.jruby.RubyString;
 import org.jruby.anno.JRubyMethod;
+import org.jruby.javasupport.JavaEmbedUtils;
 import org.jruby.runtime.ThreadContext;
 import org.jruby.runtime.builtin.IRubyObject;
 import org.jruby.util.ByteList;
 
 public class DerbyModule {
+    
     private static RubyObjectAdapter rubyApi;
-    public static void load(RubyModule arJdbc, RubyObjectAdapter adapter) {
+    
+    public static void load(final RubyModule arJdbc) {
         RubyModule derby = arJdbc.defineModuleUnder("Derby");
         derby.defineAnnotatedMethods(DerbyModule.class);
         RubyModule column = derby.defineModuleUnder("Column");
         column.defineAnnotatedMethods(Column.class);
-        rubyApi = adapter;
+        rubyApi = JavaEmbedUtils.newObjectAdapter();
     }
 
     public static class Column {
@@ -100,40 +105,43 @@ public class DerbyModule {
     }
 
     @JRubyMethod(name = "quote", required = 1, optional = 1)
-    public static IRubyObject quote(ThreadContext context, IRubyObject recv, IRubyObject[] args) {
-        Ruby runtime = recv.getRuntime();
+    public static IRubyObject quote(final ThreadContext context, final IRubyObject self, 
+        final IRubyObject[] args) {
+        final Ruby runtime = self.getRuntime();
         IRubyObject value = args[0];
-        if (args.length > 1) {
-            IRubyObject col = args[1];
-            String type = rubyApi.callMethod(col, "type").toString();
+        if ( args.length > 1 ) {
+            final IRubyObject column = args[1];
+            final String columnType = column.isNil() ? "" : rubyApi.callMethod(column, "type").toString();
             // intercept and change value, maybe, if the column type is :text or :string
-            if (type.equals("text") || type.equals("string")) {
-            	value = make_ruby_string_for_text_column(context, recv, runtime, value);
+            if ( columnType.equals("text") || columnType.equals("string") ) {
+            	value = make_ruby_string_for_text_column(context, self, runtime, value);
             }
-            String metaClass = value.getMetaClass().getName();
+            final String metaClass = value.getMetaClass().getName();
 
-            if (value instanceof RubyString) {
-                if (type.equals("string")) {
-                    return quote_string_with_surround(runtime, "'", (RubyString)value, "'");
-                } else if (type.equals("text")) {
-                    return quote_string_with_surround(runtime, "CAST('", (RubyString)value, "' AS CLOB)");
-                } else if (type.equals("binary")) {
-                    return hexquote_string_with_surround(runtime, "CAST(X'", (RubyString)value, "' AS BLOB)");
-                } else {
-                    // column type :integer or other numeric or date version
-                    if (only_digits((RubyString)value)) {
-                        return value;
-                    } else {
-                        return super_quote(context, recv, runtime, value, col);
-                    }
+            if ( value instanceof RubyString ) {
+                if ( columnType.equals("string") ) {
+                    return quote_string_with_surround(runtime, "'", (RubyString) value, "'");
                 }
-            } else if (metaClass.equals("Float") || metaClass.equals("Fixnum") || metaClass.equals("Bignum")) {
-                if (type.equals("string")) {
+                else if ( columnType.equals("text") ) {
+                    return quote_string_with_surround(runtime, "CAST('", (RubyString) value, "' AS CLOB)");
+                }
+                else if ( columnType.equals("binary") ) {
+                    return hexquote_string_with_surround(runtime, "CAST(X'", (RubyString) value, "' AS BLOB)");
+                }
+                else if ( columnType.equals("xml") ) {
+                    return quote_string_with_surround(runtime, "XMLPARSE(DOCUMENT '", (RubyString) value, "' PRESERVE WHITESPACE)");
+                }
+                else { // column type :integer or other numeric or date version
+                    return only_digits((RubyString) value) ? value : super_quote(context, self, runtime, value, column);
+                }
+            }
+            else if ( metaClass.equals("Float") || metaClass.equals("Fixnum") || metaClass.equals("Bignum") ) {
+                if ( columnType.equals("string") ) {
                     return quote_string_with_surround(runtime, "'", RubyString.objAsString(context, value), "'");
                 }
             }
         }
-        return super_quote(context, recv, runtime, value, runtime.getNil());
+        return super_quote(context, self, runtime, value, runtime.getNil());
     }
 
     /*
@@ -141,8 +149,7 @@ public class DerbyModule {
      * This method turns non stringy things into strings.
      */
     private static IRubyObject make_ruby_string_for_text_column(ThreadContext context, IRubyObject recv, Ruby runtime, IRubyObject value) {
-    	RubyModule multibyteChars = (RubyModule)
-            ((RubyModule) ((RubyModule) runtime.getModule("ActiveSupport")).getConstant("Multibyte")).getConstantAt("Chars");
+    	final RubyModule multibyteChars = getMultibyteChars(runtime);
         if (value instanceof RubyString || rubyApi.isKindOf(value, multibyteChars) || value.isNil()) {
             return value;
         }
@@ -174,8 +181,7 @@ public class DerbyModule {
         String metaClass = value.getMetaClass().getName();
 
         IRubyObject type = (col.isNil()) ? col : rubyApi.callMethod(col, "type");
-        RubyModule multibyteChars = (RubyModule)
-            ((RubyModule) ((RubyModule) runtime.getModule("ActiveSupport")).getConstant("Multibyte")).getConstantAt("Chars");
+        final RubyModule multibyteChars = getMultibyteChars(runtime);
         if (value instanceof RubyString || rubyApi.isKindOf(value, multibyteChars)) {
             RubyString svalue = RubyString.objAsString(context, value);
             if (type == runtime.newSymbol("binary") && col.getType().respondsTo("string_to_binary")) {
@@ -206,52 +212,57 @@ public class DerbyModule {
 
     private final static ByteList TWO_SINGLE = new ByteList(new byte[]{'\'','\''});
 
-    private static IRubyObject quote_string_with_surround(Ruby runtime, String before, RubyString string, String after) {
-        ByteList input = string.getByteList();
-        ByteList output = new ByteList(before.getBytes());
-        for(int i = input.begin; i< input.begin + input.realSize; i++) {
-            switch(input.bytes[i]) {
-            case '\'':
-                output.append(input.bytes[i]);
-                //FALLTHROUGH
-            default:
-                output.append(input.bytes[i]);
+    private static IRubyObject quote_string_with_surround(final Ruby runtime, 
+        final String before, final RubyString string, final String after) {
+        
+        final ByteList input = string.getByteList();
+        final ByteList output = new ByteList(before.getBytes(), input.getEncoding());
+        final byte[] inputBytes = input.unsafeBytes();
+        
+        for(int i = input.getBegin(); i< input.getBegin() + input.getRealSize(); i++) {
+            switch ( inputBytes[i] ) {
+                case '\'': output.append(inputBytes[i]); // FALLTHROUGH
+                default: output.append(inputBytes[i]);
             }
 
         }
 
         output.append(after.getBytes());
-
         return runtime.newString(output);
     }
 
     private final static byte[] HEX = {'0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F'};
 
-    private static IRubyObject hexquote_string_with_surround(Ruby runtime, String before, RubyString string, String after) {
-        ByteList input = string.getByteList();
-        ByteList output = new ByteList(before.getBytes());
+    private static IRubyObject hexquote_string_with_surround(final Ruby runtime, 
+        final String before, final RubyString string, final String after) {
+        
+        final ByteList input = string.getByteList();
+        final ByteList output = new ByteList(before.getBytes());
+        final byte[] inputBytes = input.unsafeBytes();
+        
         int written = 0;
-        for(int i = input.begin; i< input.begin + input.realSize; i++) {
-            byte b1 = input.bytes[i];
+        for(int i = input.getBegin(); i< input.getBegin() + input.getRealSize(); i++) {
+            byte b1 = inputBytes[i];
             byte higher = HEX[(((char)b1)>>4)%16];
             byte lower = HEX[((char)b1)%16];
             output.append(higher);
             output.append(lower);
             written += 2;
-            if(written >= 16334) { // max hex length = 16334
+            if (written >= 16334) { // max hex length = 16334
                 output.append("'||X'".getBytes());
                 written = 0;
             }
         }
 
         output.append(after.getBytes());
-        return runtime.newStringShared(output);
+        return RubyString.newStringShared(runtime, output);
     }
 
-    private static boolean only_digits(RubyString inp) {
-        ByteList input = inp.getByteList();
-        for(int i = input.begin; i< input.begin + input.realSize; i++) {
-            if(input.bytes[i] < '0' || input.bytes[i] > '9') {
+    private static boolean only_digits(final RubyString string) {
+        final ByteList input = string.getByteList();
+        final byte[] inputBytes = input.unsafeBytes();
+        for ( int i = input.getBegin(); i< input.getBegin() + input.getRealSize(); i++ ) {
+            if ( inputBytes[i] < '0' || inputBytes[i] > '9' ) {
                 return false;
             }
         }
@@ -259,33 +270,42 @@ public class DerbyModule {
     }
 
     @JRubyMethod(name = "quote_string", required = 1)
-    public static IRubyObject quote_string(IRubyObject recv, IRubyObject string) {
-        boolean replacementFound = false;
-        ByteList bl = ((RubyString) string).getByteList();
-
-        for(int i = bl.begin; i < bl.begin + bl.realSize; i++) {
-            switch (bl.bytes[i]) {
-            case '\'': break;
-            default: continue;
+    public static IRubyObject quote_string(final IRubyObject self, IRubyObject string) {
+        ByteList bytes = ((RubyString) string).getByteList();
+        
+        boolean replacement = false;
+        for ( int i = 0; i < bytes.length(); i++ ) {
+            switch ( bytes.get(i) ) {
+                case '\'': break;
+                default: continue;
+            }
+            // on first replacement allocate so we don't manip original
+            if ( ! replacement ) {
+                bytes = new ByteList(bytes);
+                replacement = true;
             }
 
-            // On first replacement allocate a different bytelist so we don't manip original
-            if(!replacementFound) {
-                i-= bl.begin;
-                bl = new ByteList(bl);
-                replacementFound = true;
-            }
-
-            bl.replace(i, 1, TWO_SINGLE);
-            i+=1;
+            bytes.replace(i, 1, TWO_SINGLE);
+            i += 1;
         }
-        if(replacementFound) {
-            return recv.getRuntime().newStringShared(bl);
-        } else {
-            return string;
-        }
+        
+        return replacement ? RubyString.newStringShared(self.getRuntime(), bytes) : string;
     }
 
+    @JRubyMethod(name = "quoted_true", required = 0, frame = false)
+    public static IRubyObject quoted_true(
+            final ThreadContext context, 
+            final IRubyObject self) {
+        return RubyString.newString(context.getRuntime(), BYTES_1);
+    }
+    
+    @JRubyMethod(name = "quoted_false", required = 0, frame = false)
+    public static IRubyObject quoted_false(
+            final ThreadContext context, 
+            final IRubyObject self) {
+        return RubyString.newString(context.getRuntime(), BYTES_0);
+    }
+    
     @JRubyMethod(name = "select_all", rest = true)
     public static IRubyObject select_all(IRubyObject recv, IRubyObject[] args) {
         return rubyApi.callMethod(recv, "execute", args);
@@ -306,19 +326,30 @@ public class DerbyModule {
     }
 
     @JRubyMethod(name = "_execute", required = 1, optional = 1)
-    public static IRubyObject _execute(ThreadContext context, IRubyObject recv, IRubyObject[] args) throws SQLException, java.io.IOException {
-        Ruby runtime = recv.getRuntime();
-        RubyJdbcConnection conn = (RubyJdbcConnection) rubyApi.getInstanceVariable(recv, "@connection");
-        String sql = args[0].toString().trim().toLowerCase();
-        if (sql.charAt(0) == '(') {
-            sql = sql.substring(1).trim();
+    public static IRubyObject _execute(final ThreadContext context, final IRubyObject self, final IRubyObject[] args) 
+        throws SQLException, java.io.IOException {
+        final IRubyObject sql = args[0];
+        
+        String sqlStr = sql.toString().trim();
+        if ( sqlStr.charAt(0) == '(' ) sqlStr = sqlStr.substring(1).trim();
+        sqlStr = sqlStr.substring( 0, Math.min(6, sqlStr.length()) ).toLowerCase();
+        
+        final RubyJdbcConnection connection = (RubyJdbcConnection) rubyApi.getInstanceVariable(self, "@connection");
+        
+        if (sqlStr.startsWith("insert")) {
+            return connection.execute_insert(context, sql);
         }
-        if (sql.startsWith("insert")) {
-            return conn.execute_insert(context, args[0]);
-        } else if (sql.startsWith("select") || sql.startsWith("show") || sql.startsWith("values")) {
-            return conn.execute_query(context, args[0]);
-        } else {
-            return conn.execute_update(context, args[0]);
+        else if (sqlStr.startsWith("select") || sqlStr.startsWith("show") || sqlStr.startsWith("values")) {
+            return connection.execute_query(context, sql);
+        }
+        else {
+            return connection.execute_update(context, sql);
         }
     }
+    
+    private static RubyModule getMultibyteChars(final Ruby runtime) {
+        return (RubyModule) ((RubyModule) runtime.getModule("ActiveSupport").
+                getConstant("Multibyte")).getConstantAt("Chars");
+    }
+    
 }

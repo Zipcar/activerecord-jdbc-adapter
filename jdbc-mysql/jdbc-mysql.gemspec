@@ -8,17 +8,17 @@ Gem::Specification.new do |s|
   s.version = version
 
   s.authors = ["Nick Sieger, Ola Bini and JRuby contributors"]
-  s.date = %q{2010-12-08}
-  s.description = %q{Install this gem and require 'mysql' within JRuby to load the driver.}
   s.email = %q{nick@nicksieger.com, ola.bini@gmail.com}
 
   s.files = [
-    "Rakefile", "README.txt", "LICENSE.txt",
+    "Rakefile", "README.md", "LICENSE.txt",
     *Dir["lib/**/*"].to_a
   ]
   s.homepage = %q{https://github.com/jruby/activerecord-jdbc-adapter}
-  s.rdoc_options = ["--main", "README.txt"]
+  s.rdoc_options = ["--main", "README.md"]
   s.require_paths = ["lib"]
   s.rubyforge_project = %q{jruby-extras}
-  s.summary = %q{MySQL JDBC driver for Java and MySQL/ActiveRecord-JDBC.}
+
+  s.summary = %q{MySQL JDBC driver for JRuby and MySQL/ActiveRecord-JDBC (activerecord-jdbcmysql-adapter).}
+  s.description = %q{Install this gem `require 'jdbc/mysql'` and invoke `Jdbc::MySQL.load_driver` within JRuby to load the driver.}
 end

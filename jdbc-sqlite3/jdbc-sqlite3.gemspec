@@ -8,18 +8,18 @@ Gem::Specification.new do |s|
   s.version = version
 
   s.authors = ["Nick Sieger, Ola Bini and JRuby contributors"]
-  s.date = %q{2011-06-16}
-  s.description = %q{Install this gem and require 'sqlite3' within JRuby to load the driver.}
   s.email = %q{nick@nicksieger.com, ola.bini@gmail.com}
 
   s.files = [
-    "Rakefile", "README.txt", "LICENSE.txt",
+    "Rakefile", "README.md", "LICENSE.txt",
     *Dir["lib/**/*"].to_a
   ]
 
   s.homepage = %q{https://github.com/jruby/activerecord-jdbc-adapter}
-  s.rdoc_options = ["--main", "README.txt"]
+  s.rdoc_options = ["--main", "README.md"]
   s.require_paths = ["lib"]
   s.rubyforge_project = %q{jruby-extras}
-  s.summary = %q{SQLite3 JDBC driver for Java and SQLite3/ActiveRecord-JDBC.}
+
+  s.summary = %q{SQLite3 JDBC driver for JRuby and SQLite3/ActiveRecord-JDBC (activerecord-jdbcsqlite3-adapter).}
+  s.description = %q{Install this gem `require 'jdbc/sqlite3'` and invoke `Jdbc::SQLite3.load_driver` within JRuby to load the driver.}
 end

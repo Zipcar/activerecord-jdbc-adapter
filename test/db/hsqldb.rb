@@ -1,3 +1,5 @@
+require 'test_helper'
+
 config = {
   :adapter => 'hsqldb',
   :database => 'test.db'

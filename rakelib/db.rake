@@ -1,7 +1,8 @@
+require File.expand_path '../../test/helper', __FILE__
 namespace :db do
   desc "Creates the test database for MySQL."
   task :mysql do
-    load 'test/db/mysql.rb' rescue nil
+    load 'test/db/mysql_config.rb' rescue nil
     t = Tempfile.new("mysql")
     t.puts <<-SQL
 DROP DATABASE IF EXISTS `#{MYSQL_CONFIG[:database]}`;
@@ -23,8 +24,8 @@ SQL
 
   desc "Creates the test database for PostgreSQL."
   task :postgres do
-    fail unless have_postgres?
-    load 'test/db/postgres.rb' rescue nil
+    fail unless PostgresHelper.have_postgres?
+    load 'test/db/postgres_config.rb' rescue nil
     t = Tempfile.new("psql")
     t.puts <<-SQL
 DROP DATABASE IF EXISTS #{POSTGRES_CONFIG[:database]};
